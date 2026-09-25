@@ -1,0 +1,61 @@
+function clearWebCache() {
+  document.getElementById("webCacheSize").textContent = "当前占用：清理中…";
+  toast("正在清除网页缓存…");
+  api("/api/settings", { clearWebCache: true }, function (error, result) {
+    if (error) {
+      toast(error.message, true);
+      refresh();
+      return;
+    }
+    toast(result.message || "网页缓存已清除");
+    setTimeout(refresh, 500);
+  });
+}
+
+function saveWebViewSettings(includeScript) {
+  var resolution = document.getElementById("webViewResolution"),
+    pageScale = document.getElementById("webViewPageScale"),
+    userAgent = document.getElementById("webViewUserAgent"),
+    browserVersion = document.getElementById("webViewBrowserVersion"),
+    images = document.getElementById("webViewLoadImages"),
+    autoPlaySniffed = document.getElementById("webViewAutoPlaySniffed"),
+    adBlock = document.getElementById("webViewAdBlock"),
+    webRtc = document.getElementById("webViewWebRtcEnabled");
+  var payload = {
+    webViewResolution: resolution.value,
+    webViewPageScale: Number(pageScale.value),
+    webViewUserAgent: userAgent.value,
+    webViewBrowserVersion: browserVersion.value,
+    webViewLoadImages: images.checked,
+    webViewAutoPlaySniffed: autoPlaySniffed.checked,
+    webViewAdBlock: adBlock.checked,
+    webViewWebRtcEnabled: webRtc.checked
+  };
+  api(
+    "/api/settings",
+    payload,
+    function (error) {
+      if (error) {
+        toast(error.message, true);
+        refresh();
+        return;
+      }
+      toast("浏览器配置已保存");
+    }
+  );
+}
+function renderPageState() {
+  var s = state.settings;
+  document.getElementById("webViewResolution").value = s.webViewResolution || "720p";
+  document.getElementById("webViewPageScale").value = String(s.webViewPageScale || 1);
+  document.getElementById("webViewUserAgent").value = s.webViewUserAgent || "windows";
+  document.getElementById("webViewBrowserVersion").value =
+    s.webViewBrowserVersion || "native";
+  document.getElementById("webViewLoadImages").checked = s.webViewLoadImages !== false;
+  document.getElementById("webViewAutoPlaySniffed").checked = s.webViewAutoPlaySniffed === true;
+  document.getElementById("webViewAdBlock").checked = s.webViewAdBlock !== false;
+  document.getElementById("webViewWebRtcEnabled").checked = s.webViewWebRtcEnabled === true;
+  document.getElementById("webCacheSize").textContent =
+    "系统 WebView · 当前占用：" + formatBytes(Number(s.webViewCacheBytes) || 0);
+}
+startPage();

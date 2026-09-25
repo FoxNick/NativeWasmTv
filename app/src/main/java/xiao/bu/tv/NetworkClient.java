@@ -50,6 +50,8 @@ final class NetworkClient {
         if (context == null) {
             throw new IllegalStateException("Network client is not initialized");
         }
+        // Saving unrelated settings must not cancel active playback requests.
+        if (mode.equals(getDnsMode())) return;
         context.getSharedPreferences(MainActivity.PREFERENCES, Context.MODE_PRIVATE)
                 .edit().putString(PREF_DNS, mode).apply();
         if (client != null) {
@@ -69,7 +71,18 @@ final class NetworkClient {
     }
 
     static HttpURLConnection open(URL url) throws IOException {
+        String github = GithubProxy.githubSource(url.toString());
+        if (github != null) {
+            if (!GithubProxy.isEnabled()) return factory().open(new URL(github));
+            return new GithubConnection(url, target -> factory().open(target));
+        }
         return factory().open(url);
+    }
+
+    /** Shared OkHttp client for callers that need response headers or streaming bodies. */
+    static synchronized OkHttpClient sharedClient() {
+        factory();
+        return client;
     }
 
     private static synchronized OkUrlFactory factory() {
@@ -77,7 +90,7 @@ final class NetworkClient {
             Dns dns = DNS_SYSTEM.equals(getDnsMode())
                     ? Dns.SYSTEM : new PublicDns(getDnsMode());
             OkHttpClient.Builder builder = new OkHttpClient.Builder()
-                    .dns(dns)
+                    .dns(new ProcessDns(dns))
                     .connectTimeout(10, TimeUnit.SECONDS)
                     .readTimeout(20, TimeUnit.SECONDS)
                     .writeTimeout(20, TimeUnit.SECONDS)

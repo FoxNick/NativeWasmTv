@@ -142,9 +142,11 @@ final class YangshipinWebResolver {
             settings.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         }
 
+        final WebView createdView = webView;
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public boolean onConsoleMessage(ConsoleMessage consoleMessage) {
+                if (createdView != webView) return true;
                 if (consoleMessage != null) {
                     String message = consoleMessage.message();
                     if (maybeResolveApiAuth(message) || maybeResolveApiResult(message)) {
@@ -155,7 +157,7 @@ final class YangshipinWebResolver {
                 return super.onConsoleMessage(consoleMessage);
             }
         });
-        webView.setWebViewClient(new WebViewClient() {
+        WebViewRecovery.attach(webView, new WebViewClient() {
             @Override
             public void onReceivedSslError(WebView view, SslErrorHandler handler,
                     SslError error) {
@@ -204,6 +206,26 @@ final class YangshipinWebResolver {
                 if (pending != null && failingUrl != null
                         && failingUrl.contains("yangshipin.cn")) {
                     fail(pending, description == null ? "央视频页面加载失败" : description);
+                }
+            }
+        }, this::onRendererGone);
+    }
+
+    private int lifecycleGeneration;
+
+    private void onRendererGone(WebView failed, boolean crashed) {
+        if (failed != webView) return;
+        final Pending request = pendingRequest;
+        failed.removeCallbacks(timeout);
+        failed.removeCallbacks(pollPage);
+        failed.removeCallbacks(traceKeepAlive);
+        webView = null;
+        clearPending(false);
+        final int generation = lifecycleGeneration;
+        if (request != null) root.post(new Runnable() {
+            @Override public void run() {
+                if (generation == lifecycleGeneration && !activity.isFinishing()) {
+                    request.callback.onFailed(request.requestId, "央视频解析进程已退出，请重新选择频道");
                 }
             }
         });
@@ -279,7 +301,24 @@ final class YangshipinWebResolver {
         values.put("ERROR_PREFIX", JSONObject.quote(API_ERROR_PREFIX));
         values.put("AUTH_PREFIX", JSONObject.quote(API_AUTH_PREFIX));
         values.put("AUTH_BODY", JSONObject.quote(payload.authBody));
-        return pluginScript("api-page.html.tpl", values);
+        String html = pluginScript("api-page.html.tpl", values);
+        if (Build.VERSION.SDK_INT < 21) {
+            // Keep plugin API/signing logic unchanged; old Chromium's HTTPS XHR
+            // uses a different TLS stack from the app's compatible HTTP client.
+            String shim = "<script>(function(){"
+                    + "window.XMLHttpRequest=function(){this.headers={};this.readyState=0;this.status=0;};"
+                    + "var p=XMLHttpRequest.prototype;"
+                    + "p.open=function(m,u){this.method=m;this.url=u;this.readyState=1;};"
+                    + "p.setRequestHeader=function(k,v){this.headers[k]=v;};"
+                    + "p.abort=function(){this.aborted=true;};"
+                    + "p.send=function(b){var x=this;setTimeout(function(){if(x.aborted)return;"
+                    + "try{var r=JSON.parse(NtvYspSigner.request(x.method,x.url,JSON.stringify(x.headers),b==null?'':String(b)));"
+                    + "x.status=r.code||0;x.responseText=r.body||'';x.readyState=4;"
+                    + "if(x.onreadystatechange)x.onreadystatechange();}catch(e){if(x.onerror)x.onerror();}},0);};"
+                    + "})();</script>";
+            html = shim + html;
+        }
+        return html;
     }
 
     private boolean maybeResolveApiAuth(String message) {
@@ -364,6 +403,35 @@ final class YangshipinWebResolver {
     }
 
     final class SignerBridge {
+        @JavascriptInterface
+        public String request(String method, String url, String headersJson, String body) {
+            try {
+                URI uri = URI.create(url);
+                String host = uri.getHost(), path = uri.getPath();
+                boolean auth = "player-api.yangshipin.cn".equals(host)
+                        && ("/v1/player/auth".equals(path) || "/v1/player/get_live_info".equals(path));
+                boolean token = "h5access.yangshipin.cn".equals(host) && "/web/open/token".equals(path);
+                if (Build.VERSION.SDK_INT >= 21 || pendingRequest == null
+                        || !"https".equals(uri.getScheme()) || uri.getUserInfo() != null
+                        || uri.getPort() != -1 && uri.getPort() != 443
+                        || !(auth && "POST".equals(method) || token && "GET".equals(method)))
+                    return "{\"code\":0,\"error\":\"unsupported request\"}";
+                JSONObject headers = new JSONObject(headersJson);
+                headers.put("User-Agent", DESKTOP_USER_AGENT);
+                headers.put("Origin", "https://www.yangshipin.cn");
+                headers.put("Referer", "https://www.yangshipin.cn/");
+                String cookie = CookieManager.getInstance().getCookie(url);
+                if (cookie != null) headers.put("Cookie", cookie);
+                String result = Ku9HttpClient.requestJson(url, method, headers.toString(), body, false, 1024 * 1024);
+                JSONObject response = new JSONObject(result);
+                Log.i(TAG, "Legacy native API path=" + path + " code=" + response.optInt("code")
+                        + " error=" + response.optString("error"));
+                return result;
+            } catch (Exception error) {
+                Log.w(TAG, "Legacy native API request failed", error);
+                return "{\"code\":0}";
+            }
+        }
         @JavascriptInterface
         public String tokenRnd(String guid, String timestampMs) {
             try {
@@ -665,16 +733,24 @@ final class YangshipinWebResolver {
     }
 
     private void pollPageForVideoUrl() {
-        if (pendingRequest == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT) {
+        final Pending expectedRequest = pendingRequest;
+        final WebView expectedView = webView;
+        if (expectedRequest == null || expectedView == null
+                || Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT) {
             return;
         }
         webView.evaluateJavascript(pluginScript("poll-page.js", null),
                 new ValueCallback<String>() {
                     @Override
                     public void onReceiveValue(String value) {
+                        if (expectedView != webView || expectedRequest != pendingRequest) return;
                         String url = decodeJsString(value);
-                        if (url != null && url.length() > 0) maybeResolve(url);
-                        if (pendingRequest != null) webView.postDelayed(pollPage, 1000L);
+                        if (url != null && url.length() > 0) {
+                            maybeResolve(url);
+                        }
+                        if (expectedView == webView && expectedRequest == pendingRequest) {
+                            expectedView.postDelayed(pollPage, 1000L);
+                        }
                     }
                 });
     }
@@ -726,6 +802,7 @@ final class YangshipinWebResolver {
     }
 
     private void clearPending(boolean stopPage) {
+        lifecycleGeneration++;
         WebView currentWebView = webView;
         if (currentWebView != null) {
             currentWebView.removeCallbacks(timeout);

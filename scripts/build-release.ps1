@@ -1,8 +1,10 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$OutputDirectory,
     [string]$JavaHome,
     [string]$ReleaseNotes = '修复问题并提升播放体验。',
+    [switch]$ImportantUpdate,
+    [switch]$Clean,
     [switch]$SkipClean,
     [string]$NdkRoot,
     [switch]$RebuildQuickJs,
@@ -14,7 +16,7 @@ Set-StrictMode -Version Latest
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 if (-not $OutputDirectory) {
-    $OutputDirectory = Join-Path $repoRoot 'app\build\outputs\apk'
+    $OutputDirectory = Join-Path $repoRoot 'output'
 }
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 
@@ -157,7 +159,7 @@ if ($RebuildTls -or $NdkRoot) {
 if (!(Test-Path -LiteralPath (Join-Path $repoRoot 'app/src/main/libs/armeabi-v7a/libntvtls.so'))) {
     throw 'Legacy TLS library missing. Run scripts/build-tls.ps1 -NdkRoot <NDK-r14b> first.'
 }
-if (-not $SkipClean) { $gradleTasks += 'clean' }
+if ($Clean -and -not $SkipClean) { $gradleTasks += 'clean' }
 $gradleTasks += @(':app:assembleArm32Release', ':app:assembleArm64Release', '--no-daemon')
 
 Push-Location $repoRoot
@@ -173,11 +175,13 @@ $artifacts = @(
     [pscustomobject]@{
         Name = 'nTv.apk'
         Source = Join-Path $repoRoot 'app\build\outputs\apk\arm32\release\app-arm32-release.apk'
+        Mapping = Join-Path $repoRoot 'app\build\outputs\mapping\arm32\release\mapping.txt'
         ExpectedAbi = 'armeabi-v7a'
     },
     [pscustomobject]@{
         Name = 'nTv64.apk'
         Source = Join-Path $repoRoot 'app\build\outputs\apk\arm64\release\app-arm64-release.apk'
+        Mapping = Join-Path $repoRoot 'app\build\outputs\mapping\arm64\release\mapping.txt'
         ExpectedAbi = 'arm64-v8a'
     }
 )
@@ -186,6 +190,18 @@ New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $results = foreach ($artifact in $artifacts) {
     if (-not (Test-Path -LiteralPath $artifact.Source)) {
         throw "Expected APK was not generated: $($artifact.Source)"
+    }
+    if (-not (Test-Path -LiteralPath $artifact.Mapping)) {
+        throw "Release obfuscation mapping was not generated: $($artifact.Mapping)"
+    }
+    $renamedApplicationClass = Get-Content -LiteralPath $artifact.Mapping |
+        Where-Object {
+            if ($_ -notmatch '^(xiao\.bu\.tv\.[^ ]+) -> ([^:]+):$') { return $false }
+            return $Matches[1] -ne $Matches[2]
+        } |
+        Select-Object -First 1
+    if (-not $renamedApplicationClass) {
+        throw "Release mapping contains no obfuscated application classes: $($artifact.Mapping)"
     }
     $destination = Join-Path $OutputDirectory $artifact.Name
     Copy-Item -LiteralPath $artifact.Source -Destination $destination -Force
@@ -211,6 +227,7 @@ $results = foreach ($artifact in $artifacts) {
         ABI = $architectures[0]
         SizeMB = [math]::Round($file.Length / 1MB, 2)
         SHA256 = $hash
+        Obfuscation = 'verified'
         Metadata = $badging
         Path = $file.FullName
     }
@@ -228,6 +245,9 @@ $manifestTasks = @(
     "-PreleaseNotes=$ReleaseNotes",
     '--no-daemon'
 )
+if ($ImportantUpdate) {
+    $manifestTasks += '-PimportantUpdate=true'
+}
 Push-Location $repoRoot
 try {
     & (Join-Path $repoRoot 'gradlew.bat') @manifestTasks
@@ -238,18 +258,29 @@ try {
     Pop-Location
 }
 
+$liteVersionPath = Join-Path $repoRoot 'version-lite.json'
 $versionPath = Join-Path $repoRoot 'version.json'
 $legacyVersionPath = Join-Path $repoRoot 'version-iptv.json'
-$version = Get-Content -LiteralPath $versionPath -Raw | ConvertFrom-Json
+$version = Get-Content -LiteralPath $liteVersionPath -Raw | ConvertFrom-Json
 if ($version.sha25632 -ne $arm32Result.SHA256 -or
         $version.sha25664 -ne $arm64Result.SHA256) {
     throw 'Generated update metadata does not match the release APK hashes.'
 }
-Copy-Item -LiteralPath $versionPath -Destination (Join-Path $OutputDirectory 'version.json') -Force
-Copy-Item -LiteralPath $legacyVersionPath -Destination (Join-Path $OutputDirectory 'version-iptv.json') -Force
+Copy-Item -LiteralPath $liteVersionPath -Destination (Join-Path $OutputDirectory 'version-lite.json') -Force
+if ($ImportantUpdate) {
+    Copy-Item -LiteralPath $versionPath -Destination (Join-Path $OutputDirectory 'version.json') -Force
+    Copy-Item -LiteralPath $legacyVersionPath -Destination (Join-Path $OutputDirectory 'version-iptv.json') -Force
+} else {
+    foreach ($staleManifest in @('version.json', 'version-iptv.json')) {
+        $stalePath = Join-Path $OutputDirectory $staleManifest
+        if (Test-Path -LiteralPath $stalePath) {
+            Remove-Item -LiteralPath $stalePath -Force
+        }
+    }
+}
 
 Write-Host ''
 Write-Host 'Release artifacts:'
-$results | Format-List APK, ABI, SizeMB, SHA256, Metadata, Path
-Write-Host "Update metadata: $versionPath"
-Write-Host "Legacy metadata: $legacyVersionPath"
+$results | Format-List APK, ABI, SizeMB, SHA256, Obfuscation, Metadata, Path
+Write-Host "Lightweight metadata: $liteVersionPath"
+Write-Host ($(if ($ImportantUpdate) { "Important metadata updated: $versionPath" } else { 'Important metadata not included (use -ImportantUpdate when required).' }))

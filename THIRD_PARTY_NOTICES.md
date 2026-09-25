@@ -1,5 +1,15 @@
 # Third-party notices
 
+## AndroidX WebKit and Core
+
+The app uses AndroidX WebKit `1.9.0`. For its Core dependency, the build keeps
+the original `Pair` and `ObjectsCompat` class files from AndroidX Core `1.1.0`;
+unrelated Core components, resources and transitive dependencies are not bundled.
+No upstream class bytecode is modified.
+
+License: Apache License 2.0. See `third_party/material-design-icons.LICENSE`
+for the license text. Source: https://android.googlesource.com/platform/frameworks/support/
+
 ## cctv-h5e-decrypt
 
 The generated `app/src/main/jni/generated/cctv_h5e_wasm.c` and
@@ -25,3 +35,53 @@ The profile adds RTSP over TCP/UDP and the MP2 audio decoder to the upstream
 lite configuration. The Java API continues to use the published 0.8.8 AAR.
 
 License: LGPL-2.1. See the upstream project for the complete notice.
+
+## Google Material Icons
+
+The media controller embeds rounded SVG paths for previous, play, pause, next,
+favorite, settings, and download icons from
+[google/material-design-icons](https://github.com/google/material-design-icons).
+
+License: Apache License 2.0. See `third_party/material-design-icons.LICENSE`.
+
+## CryptoJS
+
+The Ku9 script compatibility runtime embeds [CryptoJS](https://github.com/brix/crypto-js)
+`3.1.9-1` for the standard `require("crypto")` module. This ES5 release remains
+compatible with the JavaScript engine shipped on Android 5.0.
+
+License: MIT. See `third_party/crypto-js.LICENSE`.
+
+## JSEncrypt
+
+The Ku9 script compatibility runtime embeds [JSEncrypt](https://github.com/travist/jsencrypt)
+`2.3.1` for the standard `require("jsencrypt")` module. This release keeps
+compatibility with the JavaScript engine shipped on Android 5.0.
+
+License: MIT. See `third_party/jsencrypt.LICENSE`.
+
+## Vinyl record artwork
+
+`app/src/main/res/drawable-nodpi/vinyl_record.png` was redrawn with OpenAI
+image generation (2026-09-16): a transparent 653 × 653 black vinyl record
+with antialiased edges and a red center label. The visual reference was
+**45 rpm record** by Paul Sherman / WP ClipArt, published in the public domain.
+Source: https://commons.wikimedia.org/wiki/File:45_rpm_record.png
+Original: https://upload.wikimedia.org/wikipedia/commons/8/88/45_rpm_record.png
+The MP3 album cover is drawn over the center at runtime.
+
+## anti-AD
+
+When web ad blocking is enabled, the app downloads the AdGuard-compatible
+domain rules from the anti-AD official service at https://anti-ad.net/adguard.txt.
+The rules are stored in the app data directory and are not bundled in the APK.
+
+License: MIT. Source: https://github.com/privacy-protection-tools/anti-AD
+
+## TextureRender (legacy screenshots)
+
+Only the upstream GLES TextureRender utility from android-transcoder is retained
+for one-shot video screenshots on old Android devices. No transcoding engine,
+encoder, capture service or casting sender is included.
+
+License: Apache-2.0. See `third_party/android-transcoder/LICENSE`.

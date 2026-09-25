@@ -1,90 +1,155 @@
 package xiao.bu.tv;
 
 import android.annotation.SuppressLint;
+import android.annotation.TargetApi;
+import android.app.ActivityManager;
 import android.content.Context;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.graphics.Bitmap;
 import android.graphics.Color;
+import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
+import android.net.http.SslError;
 import android.os.Build;
+import android.os.Bundle;
+import android.os.Message;
 import android.util.AttributeSet;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.webkit.CookieManager;
+import android.webkit.SslErrorHandler;
 import android.webkit.WebBackForwardList;
 import android.webkit.WebHistoryItem;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.webkit.ValueCallback;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
-import android.widget.ProgressBar;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.util.Locale;
-import java.net.URLDecoder;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.InputStream;
+import java.net.URLDecoder;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.Map;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 public final class WebSourceView extends FrameLayout {
+    private static final int VIEWPORT_4K_WIDTH = 3840;
+    private static final int VIEWPORT_4K_HEIGHT = 2160;
     private static final int VIEWPORT_2K_WIDTH = 2560;
     private static final int VIEWPORT_2K_HEIGHT = 1440;
     private static final int VIEWPORT_1080P_WIDTH = 1920;
     private static final int VIEWPORT_1080P_HEIGHT = 1080;
     private static final int VIEWPORT_720P_WIDTH = 1280;
     private static final int VIEWPORT_720P_HEIGHT = 720;
+    private static final long MULTI_WEBVIEW_MIN_AVAILABLE_BYTES = 200L * 1024L * 1024L;
     private static final String WINDOWS_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     + "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-    private static final String MACOS_USER_AGENT =
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                    + "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-    private static final String IPAD_USER_AGENT =
-            "Mozilla/5.0 (iPad; CPU OS 17_1 like Mac OS X) AppleWebKit/605.1.15 "
-                    + "(KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1";
     interface Listener {
         void onPageStarted(int requestId, String url);
+        default void onResourcesReset(int requestId, String url) { }
         void onPageReady(int requestId, String url, String title);
         void onPageError(int requestId, String message);
         void onStreamDiscovered(int requestId, String streamUrl, String pageUrl,
                 String userAgent, String cookies);
+
+        void onBrowserHome();
+        void onBrowserChannel(int groupIndex, int channelIndex);
+        void onBrowserDownloadImage(String url);
+        void onBrowserClipboard(String text, String message);
+        void onBrowserUserScript(String url);
+        default void onBrowserOverlayShown() { }
+        void onBrowserPoliciesChanged(boolean images, boolean adBlock, boolean webRtc);
     }
 
     private static final String TAG = "WebSourceView";
-    private WebView webView;
+    private static final java.util.regex.Pattern HLS_QUERY = java.util.regex.Pattern.compile(
+            ".*[?&](format|type)=m3u8(?:[&#].*)?$");
+    private volatile WebView webView;
+    private volatile SourceClient sourceClient;
+    private DesktopWebProfile desktopProfile;
+    private WebPageScriptManager pageScriptManager;
+    private WebRenderDiagnostics renderDiagnostics;
+    private View fullscreenView;
+    private WebChromeClient.CustomViewCallback fullscreenCallback;
     private final LinearLayout loadingOverlay;
+
+    private final WebTabBar tabBar;
+    private final BrowserIconView fullscreenExitButton;
+    private FrameLayout smartContextLayer;
+    private int tabBarHeight;
+    private boolean browserFullscreen;
+    private final Runnable hideFullscreenExit = new Runnable() {
+        @Override public void run() {
+            if (browserFullscreen) fullscreenExitButton.setVisibility(View.GONE);
+        }
+    };
+    private final Runnable settleRemoteScroll = new Runnable() {
+        @Override public void run() {
+            clampWebScrollToContent();
+        }
+    };
+    private WebTabBar.Tab loadedTab;
+    private final LinkedHashMap<WebTabBar.Tab, WebView> retainedTabWebViews =
+            new LinkedHashMap<WebTabBar.Tab, WebView>();
     private String browserUserAgent;
-    private ProgressBar loadingProgress;
+    private LoadingSpinnerView loadingProgress;
     private TextView loadingText;
     private Listener listener;
-    private int requestId = -1;
+    private volatile int requestId = -1;
     private volatile String pageUrl;
-    private final LinkedHashSet<String> discoveredStreamUrls =
-            new LinkedHashSet<String>();
-    private boolean pageActive;
+    private volatile long resourceNavigation;
+    private String resourcePageKey = "";
+    private String controllerPageTitle = "";
+    private final java.util.Set<String> discoveredStreamUrls =
+            java.util.Collections.synchronizedSet(new LinkedHashSet<String>());
+    private volatile boolean pageActive;
     private boolean clearInitialHistory;
     private boolean destroyed;
     private int resetGeneration;
     private String viewportMode = "720p";
+    private float pageScale = 1f;
+    private float currentPageScale = 1f;
     private String userAgentMode = "windows";
+    private String browserVersionMode = "native";
     private volatile String activeUserAgent = WINDOWS_USER_AGENT;
     private boolean loadImages = true;
+    private boolean adBlockEnabled = true;
+    private boolean webRtcEnabled;
+    private boolean userScriptEnabled;
+    private String userScripts = "[]";
     private int viewportWidth = VIEWPORT_720P_WIDTH;
     private int viewportHeight = VIEWPORT_720P_HEIGHT;
+    private float loadingInterfaceScale = 1f;
     private int compatibilityInjectionCount;
-    private String compatibilityBundleUrl;
-    private byte[] compatibilityBundle;
+    private int profileInjectionCount;
+    private int pagePolicyInjectionCount;
+    private int pageLoadGeneration;
+    private int pageLoadTerminalGeneration = -1;
+
+    private boolean remoteMouseHoverDispatch;
+
+    private boolean hostResumed;
+    private int rendererRetries;
+    private long cachedBrowserCacheBytes;
+    private long browserCacheMeasuredAt;
 
     public WebSourceView(Context context) {
         this(context, null);
@@ -93,12 +158,103 @@ public final class WebSourceView extends FrameLayout {
     @SuppressLint("SetJavaScriptEnabled")
     public WebSourceView(Context context, AttributeSet attrs) {
         super(context, attrs);
+        WebAdBlocker.initialize(context);
         setBackgroundColor(0xff000000);
         setClipChildren(true);
+        tabBar = new WebTabBar(context, new WebTabBar.Callback() {
+            @Override public void onReload() { reloadPage(); }
+            @Override public void onNavigate(String value) { navigateAddress(value); }
+            @Override public void onChannel(int groupIndex, int channelIndex) {
+                if (listener != null) listener.onBrowserChannel(groupIndex, channelIndex);
+            }
+            @Override public void onOpenBookmarkNewTab(String url) { openLinkInNewTab(url); }
+            @Override public void onSelect(WebTabBar.Tab tab) { loadBrowserTab(tab); }
+            @Override public void onNewTab() { openCurrentInNewTab(); }
+            @Override public void onTabClosed(WebTabBar.Tab tab) {
+                releaseTabWebView(tab, false);
+                if (tab == loadedTab) {
+                    loadedTab = null;
+                    pageActive = false;
+                    destroyCurrentWebView();
+                }
+            }
+            @Override public void onAllTabsClosed() {
+                if (listener != null) listener.onBrowserHome();
+            }
+            @Override public void onTabAdBlockChanged(WebTabBar.Tab tab) {
+                if (tab != tabBar.active()) return;
+                releaseRetainedWebViews(true);
+                updatePageScripts();
+                reloadPage();
+            }
+            @Override public void onTabMuteChanged(WebTabBar.Tab tab) {
+                if (tab == tabBar.active()) applyActiveTabMute();
+            }
+            @Override public void onTabSleepChanged(WebTabBar.Tab tab) {
+                if (tab.sleeping) {
+                    tab.state = null;
+                    if (tab != loadedTab) releaseTabWebView(tab, false);
+                }
+            }
+            @Override public void onToolbarHeightChanged(int heightDp) {
+                updateToolbarHeight(heightDp);
+            }
+            @Override public void onImagesChanged(boolean enabled) {
+                releaseRetainedWebViews(true);
+                loadImages = enabled;
+                if (webView != null) {
+                    webView.getSettings().setLoadsImagesAutomatically(enabled);
+                    webView.getSettings().setBlockNetworkImage(!enabled);
+                }
+                notifyBrowserPoliciesChanged();
+                reloadPage();
+            }
+            @Override public void onGlobalAdBlockChanged(boolean enabled) {
+                releaseRetainedWebViews(true);
+                adBlockEnabled = enabled;
+                if (enabled) WebAdBlocker.refreshAsync(false);
+                updatePageScripts();
+                notifyBrowserPoliciesChanged();
+                reloadPage();
+            }
+            @Override public void onWebRtcChanged(boolean enabled) {
+                releaseRetainedWebViews(true);
+                webRtcEnabled = enabled;
+                updatePageScripts();
+                notifyBrowserPoliciesChanged();
+                reloadPage();
+            }
+            @Override public void onEnterFullscreen() {
+                setBrowserFullscreen(true);
+            }
+        });
+        tabBarHeight = Math.round(tabBar.heightDp()
+                * getResources().getDisplayMetrics().density);
+        tabBar.setVisibility(View.GONE);
+        addView(tabBar, new LayoutParams(LayoutParams.MATCH_PARENT, tabBarHeight, Gravity.TOP));
+        fullscreenExitButton = new BrowserIconView(context, BrowserIconView.CLOSE);
+        fullscreenExitButton.setIconColor(Color.WHITE);
+        fullscreenExitButton.setContentDescription("退出网页全屏");
+        GradientDrawable exitBackground = new GradientDrawable();
+        exitBackground.setColor(0xd93f4247);
+        exitBackground.setShape(GradientDrawable.OVAL);
+        fullscreenExitButton.setBackgroundDrawable(exitBackground);
+        fullscreenExitButton.setPadding(dp(6), dp(6), dp(6), dp(6));
+        fullscreenExitButton.setOnClickListener(v -> setBrowserFullscreen(false));
+        fullscreenExitButton.setVisibility(View.GONE);
+        LayoutParams exitParams = new LayoutParams(dp(42), dp(42),
+                Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        exitParams.topMargin = dp(8);
+        addView(fullscreenExitButton, exitParams);
         // Creating even a hidden WebView initializes the Chromium/WebKit runtime and
         // noticeably delays native-channel startup on Android 4.x televisions. Keep
         // the browser lazy and create it only when a web channel is actually opened.
         webView = null;
+        final File obsoleteProxyCache = new File(context.getCacheDir(), "browser");
+        if (obsoleteProxyCache.exists()) {
+            new Thread(() -> deleteObsoleteProxyCache(obsoleteProxyCache),
+                    "web-cache-migration").start();
+        }
         loadingOverlay = createLoadingOverlay(context);
         addView(loadingOverlay, new LayoutParams(
                 LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.CENTER));
@@ -107,38 +263,326 @@ public final class WebSourceView extends FrameLayout {
 
     @SuppressLint("SetJavaScriptEnabled")
     private WebView createWebView(Context context) {
-        WebView nextWebView = new WebView(context);
+        WebView nextWebView = new BrowserWebView(context);
+        nextWebView.setOverScrollMode(View.OVER_SCROLL_NEVER);
         WebSettings settings = nextWebView.getSettings();
         if (browserUserAgent == null) {
             browserUserAgent = settings.getUserAgentString();
         }
-        if ("native".equals(userAgentMode)) {
-            activeUserAgent = browserUserAgent;
-        }
+        activeUserAgent = userAgentForMode(userAgentMode, browserVersionMode);
         configureWebViewSettings(settings);
         nextWebView.setPivotX(0f);
         nextWebView.setPivotY(0f);
         nextWebView.setInitialScale(cssInitialScalePercent());
+
         nextWebView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onReceivedTitle(WebView view, String title) {
+                if (view == webView && pageActive) {
+                    tabBar.updateActive(view.getUrl(), title);
+                    controllerPageTitle = safe(title);
+                }
+            }
+
+            @Override
+            public void onReceivedIcon(WebView view, Bitmap icon) {
+                if (view == webView && pageActive && icon != null) {
+                    tabBar.updateActiveIcon(icon);
+                }
+            }
+
+            @Override
+            public void onProgressChanged(WebView view, int progress) {
+                if (view != webView || !pageActive || requestId < 0) return;
+                if (profileInjectionCount < 6 && desktopProfile != null && !desktopProfile.hasDocumentStartProtection()
+                        && DesktopWebProfile.isSpoofed(userAgentMode) && progress > 0) {
+                    profileInjectionCount++;
+                    desktopProfile.applyToCurrentDocument();
+                }
+                if (progress >= 80) probePageReady(view, pageLoadGeneration, 0L);
+                if (progress >= 100) completePageLoadLater(view, pageLoadGeneration, 120L,
+                        "progress=100");
+            }
+
+            @Override
+            public void onShowCustomView(View view, CustomViewCallback callback) {
+                if (webView != nextWebView || !pageActive || fullscreenView != null) {
+                    callback.onCustomViewHidden();
+                    return;
+                }
+                fullscreenView = view;
+                fullscreenCallback = callback;
+                configureFullscreenMouseHover(view);
+                setLoadingVisible(false);
+                addView(view, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+                nextWebView.setVisibility(View.INVISIBLE);
+
+                view.requestFocus();
+                // Stay in the same hierarchy so fullscreen content and cursor hit-testing
+                // and the fixed landscape viewport continue to work in fullscreen.
+            }
+
+            @Override
+            public void onHideCustomView() {
+                if (webView == nextWebView) hideFullscreenView();
+            }
+
             @Override
             public Bitmap getDefaultVideoPoster() {
                 Bitmap poster = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
                 poster.eraseColor(Color.TRANSPARENT);
                 return poster;
             }
+
+            @Override
+            public boolean onCreateWindow(final WebView view, boolean isDialog,
+                    boolean isUserGesture, Message resultMsg) {
+                if (view != webView || !pageActive || destroyed || !isUserGesture) return false;
+                if (resultMsg == null
+                        || !(resultMsg.obj instanceof WebView.WebViewTransport)) return false;
+
+                // HitTestResult.getExtra() is the image source for an image link,
+                // not necessarily the link target. Routing that value here used to
+                // force image clicks into a new tab and bypass the page's JavaScript.
+                // Let Chromium execute the site's click/window.open behavior first,
+                // then route the URL that the popup actually navigates to.
+                final WebView popup = new WebView(getContext());
+                WebSettings popupSettings = popup.getSettings();
+                popupSettings.setJavaScriptEnabled(true);
+                popupSettings.setDomStorageEnabled(true);
+                final boolean[] popupRouted = { false };
+                popup.setWebViewClient(new WebViewClient() {
+                    private boolean route(String url) {
+                        if (popupRouted[0]) return true;
+                        popupRouted[0] = queuePopupNavigation(view, url, popup);
+                        return popupRouted[0];
+                    }
+
+                    @Override public boolean shouldOverrideUrlLoading(WebView ignored, String url) {
+                        return route(url);
+                    }
+
+                    @TargetApi(21)
+                    @Override public boolean shouldOverrideUrlLoading(WebView ignored,
+                            WebResourceRequest request) {
+                        Uri uri = request == null ? null : request.getUrl();
+                        return route(uri == null ? null : uri.toString());
+                    }
+
+                    @Override public void onPageStarted(WebView ignored, String url,
+                            Bitmap favicon) {
+                        route(url);
+                    }
+                });
+                WebView.WebViewTransport transport =
+                        (WebView.WebViewTransport) resultMsg.obj;
+                transport.setWebView(popup);
+                resultMsg.sendToTarget();
+                postDelayed(new Runnable() {
+                    @Override public void run() {
+                        if (popupRouted[0]) return;
+                        popup.setWebViewClient(null);
+                        popup.destroy();
+                    }
+                }, 30000L);
+                return true;
+            }
         });
-        nextWebView.setWebViewClient(new SourceClient());
+        nextWebView.setDownloadListener((url, userAgent, contentDisposition, mimeType,
+                contentLength) -> {
+            if (isUserScriptInstallUrl(url) && listener != null) {
+                listener.onBrowserUserScript(url);
+            }
+        });
+        sourceClient = new SourceClient();
+        WebViewRecovery.attach(nextWebView, sourceClient, this::onRendererGone);
+        desktopProfile = ((BrowserWebView) nextWebView).desktopPolicy;
+        pageScriptManager = ((BrowserWebView) nextWebView).pagePolicy;
+        updateDesktopProfile();
+        updatePageScripts();
         return nextWebView;
+    }
+
+    /** WebView with native mouse handling and per-tab page policies. */
+    private final class BrowserWebView extends WebView {
+        final DesktopWebProfile desktopPolicy = new DesktopWebProfile(this);
+        final WebPageScriptManager pagePolicy = new WebPageScriptManager(this);
+        private Boolean pageResumed;
+        private boolean systemSecondaryDown;
+        private boolean systemPrimaryDown;
+        private long systemContextShownAt;
+        BrowserWebView(Context context) { super(context); }
+
+        @Override public boolean onHoverEvent(MotionEvent event) {
+            int action = event.getActionMasked();
+            if ((remoteMouseHoverDispatch || isSystemMouse(event)) && Build.VERSION.SDK_INT >= 19
+                    && event.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE
+                    && (action == MotionEvent.ACTION_HOVER_MOVE
+                        || action == MotionEvent.ACTION_HOVER_EXIT)) {
+                // Chromium can consume HOVER_MOVE in its accessibility hit tester
+                // before Blink sees it, even without touch exploration enabled.
+                // A button-free native mouse MOVE reaches the document normally.
+                // Keep ViewGroup's transformed coordinates and native iframe hit testing;
+                // real accessibility hover events never enter this scoped path.
+                MotionEvent mouseMove = MotionEvent.obtain(event);
+                mouseMove.setAction(MotionEvent.ACTION_MOVE);
+                if (action == MotionEvent.ACTION_HOVER_EXIT) mouseMove.setLocation(-1f, -1f);
+                try { return super.onHoverEvent(mouseMove); }
+                finally { mouseMove.recycle(); }
+            }
+            return super.onHoverEvent(event);
+        }
+
+        @Override public boolean onGenericMotionEvent(MotionEvent event) {
+            if (Build.VERSION.SDK_INT >= 23 && isSystemMouse(event)
+                    && (event.getActionMasked() == MotionEvent.ACTION_BUTTON_PRESS
+                        || event.getActionMasked() == MotionEvent.ACTION_BUTTON_RELEASE)
+                    && event.getActionButton() == MotionEvent.BUTTON_SECONDARY) {
+                if (event.getActionMasked() == MotionEvent.ACTION_BUTTON_PRESS
+                        && android.os.SystemClock.uptimeMillis() - systemContextShownAt > 250L) {
+                    systemContextShownAt = android.os.SystemClock.uptimeMillis();
+                    showSystemMouseContext(event.getRawX(), event.getRawY());
+                }
+                return true;
+            }
+            return super.onGenericMotionEvent(event);
+        }
+
+        @Override public boolean onTouchEvent(MotionEvent event) {
+            if (isSystemMouse(event)) {
+                int action = event.getActionMasked();
+                boolean secondary = (event.getButtonState() & MotionEvent.BUTTON_SECONDARY) != 0;
+                if (action == MotionEvent.ACTION_DOWN && secondary) {
+                    systemSecondaryDown = true;
+                    systemContextShownAt = android.os.SystemClock.uptimeMillis();
+                    showSystemMouseContext(event.getRawX(), event.getRawY());
+                    return true;
+                }
+                if (systemSecondaryDown) {
+                    if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                        systemSecondaryDown = false;
+                    }
+                    return true;
+                }
+                if (action == MotionEvent.ACTION_DOWN) {
+                    systemPrimaryDown = true;
+                    runSystemMouseSelection("start", event);
+                } else if (action == MotionEvent.ACTION_MOVE && systemPrimaryDown) {
+                    runSystemMouseSelection("move", event);
+                } else if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL)
+                        && systemPrimaryDown) {
+                    runSystemMouseSelection("end", event);
+                    systemPrimaryDown = false;
+                }
+            }
+            // Primary mouse input stays entirely native. In particular, WebView
+            // owns down/move/up so dragging can select text and page widgets.
+            return super.onTouchEvent(event);
+        }
+
+        @Override protected boolean overScrollBy(int deltaX, int deltaY,
+                int scrollX, int scrollY, int scrollRangeX, int scrollRangeY,
+                int maxOverScrollX, int maxOverScrollY, boolean isTouchEvent) {
+            // The scaled desktop viewport must stop at Chromium's content edge.
+            // Some vendor WebViews otherwise reveal an empty strip after a wheel fling.
+            return super.overScrollBy(deltaX, deltaY, scrollX, scrollY,
+                    scrollRangeX, scrollRangeY, 0, 0, isTouchEvent);
+        }
+
+        void updatePageLifecycle(boolean resumed) {
+            if (pageResumed == null || pageResumed != resumed) {
+                pageResumed = resumed;
+                if (resumed) onResume(); else onPause();
+            }
+            if (Build.VERSION.SDK_INT >= 24) onVisibilityAggregated(isShown());
+        }
+    }
+
+    boolean dispatchRemoteMouseHover(View dispatchRoot, MotionEvent event) {
+        boolean previous = remoteMouseHoverDispatch;
+        remoteMouseHoverDispatch = true;
+        try { return dispatchRoot.dispatchGenericMotionEvent(event); }
+        finally { remoteMouseHoverDispatch = previous; }
+    }
+
+    private void configureFullscreenMouseHover(View view) {
+        // Chromium's fullscreen ContentView is not our BrowserWebView. Apply the
+        // same native mouse-move workaround after ViewGroup maps coordinates.
+        view.setOnHoverListener((target, event) -> {
+            int action = event.getActionMasked();
+            if ((!remoteMouseHoverDispatch && !isSystemMouse(event)) || Build.VERSION.SDK_INT < 19
+                    || event.getToolType(0) != MotionEvent.TOOL_TYPE_MOUSE
+                    || (action != MotionEvent.ACTION_HOVER_MOVE
+                        && action != MotionEvent.ACTION_HOVER_EXIT)) return false;
+            MotionEvent move = MotionEvent.obtain(event);
+            move.setAction(MotionEvent.ACTION_MOVE);
+            if (action == MotionEvent.ACTION_HOVER_EXIT) move.setLocation(-1f, -1f);
+            try { target.onHoverEvent(move); return true; }
+            finally { move.recycle(); }
+        });
+        if (view instanceof android.view.ViewGroup) {
+            android.view.ViewGroup group = (android.view.ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++)
+                configureFullscreenMouseHover(group.getChildAt(i));
+        }
+    }
+
+    @Override public boolean dispatchGenericMotionEvent(MotionEvent event) {
+        updateFullscreenExitForMouse(event);
+        return super.dispatchGenericMotionEvent(event);
+    }
+
+    private void updateFullscreenExitForMouse(MotionEvent event) {
+        if (!browserFullscreen || event == null
+                || (event.getSource() & android.view.InputDevice.SOURCE_MOUSE)
+                        != android.view.InputDevice.SOURCE_MOUSE) return;
+        int action = event.getActionMasked();
+        if (action != MotionEvent.ACTION_HOVER_MOVE && action != MotionEvent.ACTION_MOVE
+                && action != MotionEvent.ACTION_HOVER_EXIT) return;
+        int[] location = new int[2];
+        getLocationOnScreen(location);
+        float x = event.getRawX() - location[0];
+        float y = event.getRawY() - location[1];
+        boolean near = action != MotionEvent.ACTION_HOVER_EXIT && y >= 0f && y <= dp(62)
+                && Math.abs(x - getWidth() / 2f) <= dp(86);
+        removeCallbacks(hideFullscreenExit);
+        if (near) {
+            fullscreenExitButton.setVisibility(View.VISIBLE);
+            fullscreenExitButton.bringToFront();
+        } else if (fullscreenExitButton.getVisibility() == View.VISIBLE) {
+            postDelayed(hideFullscreenExit, 300L);
+        }
+    }
+
+    private void updatePageLifecycle() {
+        if (webView == null || destroyed) return;
+        boolean resumed = pageActive && isPageVisible() && hostResumed;
+        ((BrowserWebView) webView).updatePageLifecycle(resumed);
+        // Never pause/resume process-wide timers shared by other tabs.
+        dispatchWindowVisibilityChanged(getWindowVisibility());
     }
 
     private void configureWebViewSettings(WebSettings settings) {
         settings.setJavaScriptEnabled(true);
+        settings.setJavaScriptCanOpenWindowsAutomatically(true);
+        settings.setSupportMultipleWindows(true);
         settings.setDomStorageEnabled(true);
         settings.setLoadWithOverviewMode(true);
         settings.setUseWideViewPort(true);
         settings.setBuiltInZoomControls(false);
         settings.setDisplayZoomControls(false);
         settings.setSupportZoom(false);
+        settings.setGeolocationEnabled(false);
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.JELLY_BEAN_MR2) {
+            settings.setAppCacheEnabled(true);
+        }
+        // Let WebView own normal HTTP traffic and honor each site's cache headers.
+        settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+        if (Build.VERSION.SDK_INT >= 17) {
+            // Let the website choose whether to start. Requiring a gesture makes some players fall back to
+            // muted autoplay even when their own volume preference is audible.
+            settings.setMediaPlaybackRequiresUserGesture(false);
+        }
         settings.setLoadsImagesAutomatically(loadImages);
         settings.setBlockNetworkImage(!loadImages);
         settings.setUserAgentString(activeUserAgent);
@@ -148,35 +592,114 @@ public final class WebSourceView extends FrameLayout {
         CookieManager.getInstance().setAcceptCookie(true);
     }
 
+    void setMultimediaPaused(boolean paused) {
+        if(webView==null)return;
+        String script=paused
+            ? "(function(){if(window.__ntvMediaPause)return;var saved=[];function scan(d){var m=d.querySelectorAll('audio,video');for(var i=0;i<m.length;i++){var e=m[i];if(!e.__ntvPaused){e.__ntvPaused=true;saved.push([e,e.muted,!e.paused]);}e.muted=true;e.pause();}var f=d.querySelectorAll('iframe');for(var j=0;j<f.length;j++){try{if(f[j].contentDocument)scan(f[j].contentDocument);}catch(ignore){}}}var proto=window.HTMLMediaElement&&HTMLMediaElement.prototype,originalPlay=proto&&proto.play;function blockedPlay(){if(!this.__ntvPaused){this.__ntvPaused=true;saved.push([this,this.muted,true]);}else{for(var j=0;j<saved.length;j++){if(saved[j][0]===this){saved[j][2]=true;break;}}}this.muted=true;this.pause();return window.Promise?Promise.resolve():undefined;}if(proto)proto.play=blockedPlay;function apply(){scan(document);}apply();var timer=setInterval(apply,250);window.__ntvMediaPause=function(){clearInterval(timer);if(proto&&proto.play===blockedPlay)proto.play=originalPlay;for(var i=0;i<saved.length;i++){var a=saved[i];a[0].muted=a[1];delete a[0].__ntvPaused;if(a[2]){var p=a[0].play();if(p&&p.catch)p.catch(function(){});}}delete window.__ntvMediaPause;};})();"
+            : "if(window.__ntvMediaPause)window.__ntvMediaPause();";
+        if(!paused)webView.onResume();
+        if(Build.VERSION.SDK_INT>=19)webView.evaluateJavascript(script,null);
+        else webView.loadUrl("javascript:"+script);
+        if(paused)webView.onPause();
+    }
+
     private void replaceWebViewForNewPage() {
-        WebView previous = webView;
-        if (previous != null) {
-            previous.stopLoading();
-            previous.setWebViewClient(null);
-            previous.setWebChromeClient(null);
-            previous.onPause();
-            removeView(previous);
-            previous.removeAllViews();
-            previous.destroy();
-        }
+        destroyCurrentWebView();
         webView = createWebView(getContext());
         addView(webView, 0, new LayoutParams(viewportWidth, viewportHeight));
         updateDesktopViewport(getWidth(), getHeight());
     }
 
     private void destroyCurrentWebView() {
+        if (renderDiagnostics != null) renderDiagnostics.stop("destroyed");
+        hideFullscreenView();
         WebView current = webView;
         webView = null;
-        if (current == null) {
-            return;
-        }
-        current.stopLoading();
-        current.setWebViewClient(null);
-        current.setWebChromeClient(null);
-        current.onPause();
+        sourceClient = null;
+        desktopProfile = null;
+        pageScriptManager = null;
+        destroyWebViewInstance(current);
+    }
+
+    private boolean hasMemoryForAdditionalWebView() {
+        Object service = getContext().getSystemService(Context.ACTIVITY_SERVICE);
+        if (!(service instanceof ActivityManager)) return false;
+        ActivityManager.MemoryInfo memory = new ActivityManager.MemoryInfo();
+        ((ActivityManager) service).getMemoryInfo(memory);
+        return !memory.lowMemory && memory.availMem > MULTI_WEBVIEW_MIN_AVAILABLE_BYTES;
+    }
+
+    private void retainCurrentWebView(WebTabBar.Tab tab) {
+        WebView current = webView;
+        if (current == null || tab == null) return;
+        if (renderDiagnostics != null) renderDiagnostics.stop("tab-backgrounded");
+        hideFullscreenView();
+        ((BrowserWebView) current).updatePageLifecycle(false);
         removeView(current);
-        current.removeAllViews();
-        current.destroy();
+        retainedTabWebViews.put(tab, current);
+        webView = null;
+        sourceClient = null;
+        desktopProfile = null;
+        pageScriptManager = null;
+    }
+
+    private boolean activateRetainedWebView(WebTabBar.Tab tab) {
+        WebView retained = retainedTabWebViews.remove(tab);
+        if (retained == null) return false;
+        webView = retained;
+        retained.setVisibility(View.VISIBLE);
+        configureWebViewSettings(retained.getSettings());
+        retained.setInitialScale(cssInitialScalePercent());
+
+        sourceClient = new SourceClient();
+        WebViewRecovery.attach(retained, sourceClient, this::onRendererGone);
+        desktopProfile = ((BrowserWebView) retained).desktopPolicy;
+        pageScriptManager = ((BrowserWebView) retained).pagePolicy;
+        updateDesktopProfile();
+        updatePageScripts();
+        addView(retained, 0, new LayoutParams(viewportWidth, viewportHeight));
+        return true;
+    }
+
+    private void releaseTabWebView(WebTabBar.Tab tab, boolean preserveState) {
+        if (tab == null) return;
+        WebView retained = retainedTabWebViews.remove(tab);
+        if (retained == null) return;
+        if (preserveState && !tab.sleeping) {
+            Bundle state = new Bundle();
+            try {
+                if (retained.saveState(state) != null) tab.state = state;
+            } catch (RuntimeException error) {
+                Log.w(TAG, "Unable to save background tab " + tab.id, error);
+                tab.state = null;
+            }
+        } else {
+            tab.state = null;
+        }
+        destroyWebViewInstance(retained);
+    }
+
+    private void releaseRetainedWebViews(boolean preserveState) {
+        WebTabBar.Tab[] tabs = retainedTabWebViews.keySet().toArray(
+                new WebTabBar.Tab[retainedTabWebViews.size()]);
+        for (WebTabBar.Tab tab : tabs) releaseTabWebView(tab, preserveState);
+    }
+
+    private void destroyWebViewInstance(WebView target) {
+        if (target == null) return;
+        ((BrowserWebView) target).desktopPolicy.dispose();
+        ((BrowserWebView) target).pagePolicy.dispose();
+        try { target.stopLoading(); } catch (RuntimeException ignored) { }
+        target.setWebChromeClient(null);
+        target.setWebViewClient(null);
+        try { ((BrowserWebView) target).updatePageLifecycle(false); }
+        catch (RuntimeException ignored) { }
+        android.view.ViewParent parent = target.getParent();
+        if (parent instanceof android.view.ViewGroup) {
+            ((android.view.ViewGroup) parent).removeView(target);
+        }
+        target.removeAllViews();
+        target.destroy();
     }
 
     /*
@@ -197,8 +720,7 @@ public final class WebSourceView extends FrameLayout {
         card.setOrientation(LinearLayout.HORIZONTAL);
         card.setGravity(Gravity.CENTER_VERTICAL);
 
-        loadingProgress = new ProgressBar(context, null,
-                android.R.attr.progressBarStyleSmall);
+        loadingProgress = new LoadingSpinnerView(context);
         card.addView(loadingProgress);
 
         loadingText = new TextView(context);
@@ -244,6 +766,74 @@ public final class WebSourceView extends FrameLayout {
         }
     }
 
+    private void beginPageLoad(final WebView view) {
+        if (view == null || view != webView || !pageActive || requestId < 0) return;
+        final int generation = ++pageLoadGeneration;
+        pageLoadTerminalGeneration = -1;
+        setLoadingVisible(true);
+        probePageReady(view, generation, 700L);
+        probePageReady(view, generation, 1800L);
+        probePageReady(view, generation, 4000L);
+        postDelayed(new Runnable() {
+            @Override public void run() {
+                if (!isCurrentPageLoad(view, generation)) return;
+                Log.w(TAG, "Web loading timeout released overlay progress=" + view.getProgress()
+                        + " url=" + view.getUrl());
+                completePageLoad(view, generation, "timeout");
+            }
+        }, 20000L);
+    }
+
+    private boolean isCurrentPageLoad(WebView view, int generation) {
+        return view != null && view == webView && pageActive && requestId >= 0
+                && generation == pageLoadGeneration
+                && pageLoadTerminalGeneration != generation && !destroyed;
+    }
+
+    private void probePageReady(final WebView view, final int generation, long delayMs) {
+        postDelayed(new Runnable() {
+            @Override public void run() {
+                if (!isCurrentPageLoad(view, generation)) return;
+                if (desktopProfile != null && !desktopProfile.hasDocumentStartProtection()
+                        && DesktopWebProfile.isSpoofed(userAgentMode)) {
+                    desktopProfile.applyToCurrentDocument();
+                }
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT) return;
+                view.evaluateJavascript("(function(){return !!document.body&&"
+                                + "(document.readyState==='interactive'||document.readyState==='complete')})()",
+                        value -> {
+                            if ("true".equals(value) && isCurrentPageLoad(view, generation)) {
+                                completePageLoad(view, generation, "dom-ready");
+                            }
+                        });
+            }
+        }, Math.max(0L, delayMs));
+    }
+
+    private void completePageLoadLater(final WebView view, final int generation,
+            long delayMs, final String reason) {
+        postDelayed(new Runnable() {
+            @Override public void run() {
+                if (isCurrentPageLoad(view, generation) && view.getProgress() >= 100) {
+                    completePageLoad(view, generation, reason);
+                }
+            }
+        }, delayMs);
+    }
+
+    private void completePageLoad(WebView view, int generation, String reason) {
+        if (!isCurrentPageLoad(view, generation)) return;
+        pageLoadTerminalGeneration = generation;
+        setLoadingVisible(false);
+        String current = view.getUrl();
+        if (isWebPage(current)) pageUrl = current;
+        tabBar.updateActive(pageUrl, view.getTitle());
+        controllerPageTitle = safe(view.getTitle());
+        Log.i(TAG, "Web page usable reason=" + reason + " progress=" + view.getProgress()
+                + " url=" + pageUrl);
+        if (listener != null) listener.onPageReady(requestId, pageUrl, view.getTitle());
+    }
+
     @Override
     protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
         super.onSizeChanged(width, height, oldWidth, oldHeight);
@@ -255,19 +845,25 @@ public final class WebSourceView extends FrameLayout {
     }
 
     private void updateDesktopViewport(int width, int height) {
+        int previousViewportWidth = viewportWidth;
+        int contentHeight = height > 0 ? Math.max(1, height - tabBarHeight) : height;
         // Configuration is applied during Activity startup, before this container has
         // a measured size. The configured resolution controls the virtual width; the
         // virtual height follows the real WebView area so pages fill every aspect ratio.
-        if ("2k".equals(viewportMode)) {
+        if ("4k".equals(viewportMode)) {
+            viewportWidth = VIEWPORT_4K_WIDTH;
+        } else if ("2k".equals(viewportMode)) {
             viewportWidth = VIEWPORT_2K_WIDTH;
         } else if ("1080p".equals(viewportMode)) {
             viewportWidth = VIEWPORT_1080P_WIDTH;
         } else {
             viewportWidth = VIEWPORT_720P_WIDTH;
         }
-        if (width > 0 && height > 0) {
+        if (width > 0 && contentHeight > 0) {
             viewportHeight = Math.max(1,
-                    Math.round(viewportWidth * (height / (float) width)));
+                    Math.round(viewportWidth * (contentHeight / (float) width)));
+        } else if (viewportWidth == VIEWPORT_4K_WIDTH) {
+            viewportHeight = VIEWPORT_4K_HEIGHT;
         } else if (viewportWidth == VIEWPORT_2K_WIDTH) {
             viewportHeight = VIEWPORT_2K_HEIGHT;
         } else if (viewportWidth == VIEWPORT_1080P_WIDTH) {
@@ -275,43 +871,69 @@ public final class WebSourceView extends FrameLayout {
         } else {
             viewportHeight = VIEWPORT_720P_HEIGHT;
         }
+        if (previousViewportWidth != viewportWidth) {
+            setInterfaceScale(loadingInterfaceScale);
+        }
+        updateDesktopProfile();
         if (webView == null) {
             return;
         }
+        // Keep WebView at its real on-screen size. Scaling a WebView child with
+        // setScaleX/Y looks correct in the Activity window, but several Android
+        // WebView implementations capture its backing layer at the unscaled
+        // size. On wide viewports that leaves a large empty strip at the right
+        // or bottom after scrolling. The meta viewport below still supplies the
+        // requested logical desktop width.
+        int contentWidth = width > 0 ? width : viewportWidth;
+        int layoutHeight = contentHeight > 0 ? contentHeight : viewportHeight;
         LayoutParams params = (LayoutParams) webView.getLayoutParams();
-        if (params.width != viewportWidth || params.height != viewportHeight) {
-            params.width = viewportWidth;
-            params.height = viewportHeight;
+        if (params.width != contentWidth || params.height != layoutHeight
+                || params.topMargin != tabBarHeight) {
+            params.width = contentWidth;
+            params.height = layoutHeight;
+            params.topMargin = tabBarHeight;
             webView.setLayoutParams(params);
         }
         if (width <= 0 || height <= 0) {
             return;
         }
-        // Rounding the virtual height can leave a sub-pixel difference. Independent
-        // final scales remove that difference without changing the effective ratio.
-        webView.setScaleX(width / (float) viewportWidth);
-        webView.setScaleY(height / (float) viewportHeight);
+        webView.setScaleX(1f);
+        webView.setScaleY(1f);
         webView.setTranslationX(0f);
         webView.setTranslationY(0f);
+        webView.post(this::clampWebScrollToContent);
+        if (pageActive) {
+            if (renderDiagnostics == null) renderDiagnostics = new WebRenderDiagnostics(getContext());
+            renderDiagnostics.update(webView,
+                    viewportWidth, viewportHeight);
+        }
     }
 
     private void applyDesktopViewport() {
         if (webView == null) {
             return;
         }
+        if (desktopProfile != null) desktopProfile.applyToCurrentDocument();
         String initialScale = String.format(Locale.US, "%.4f", cssInitialScale());
-        String content = "width=" + viewportWidth
+        // Desktop page zoom changes the CSS layout viewport, not just the visual
+        // viewport. Keeping width fixed here crops a full-size layout at 200%.
+        int layoutWidth = Math.max(1, Math.round(viewportWidth / effectivePageScale()));
+        String content = "width=" + layoutWidth
                 + ",initial-scale=" + initialScale
                 + ",minimum-scale=" + initialScale
                 + ",maximum-scale=" + initialScale + ",user-scalable=no,viewport-fit=cover";
         String script = "(function(w){var d=document,t='" + content + "';"
                 + "w.__ntvViewportTarget=t;var a=function(){"
+                + "var p=d.head||d.documentElement;"
+                + "if(!p){if(!w.__ntvViewportWaiting&&d.addEventListener){"
+                + "w.__ntvViewportWaiting=true;d.addEventListener('DOMContentLoaded',function(){"
+                + "w.__ntvViewportWaiting=false;a();},false);}return;}"
                 + "var m=d.querySelector('meta[name=viewport]');"
                 + "if(!m){m=d.createElement('meta');m.name='viewport';"
-                + "(d.head||d.documentElement).appendChild(m);}"
+                + "p.appendChild(m);}"
                 + "if(m.content!==w.__ntvViewportTarget)m.content=w.__ntvViewportTarget;};"
                 + "w.__ntvApplyViewport=a;a();"
-                + "if(!w.__ntvViewportObserver&&w.MutationObserver){"
+                + "if(!w.__ntvViewportObserver&&w.MutationObserver&&d.documentElement){"
                 + "w.__ntvViewportObserver=new MutationObserver(a);"
                 + "w.__ntvViewportObserver.observe(d.documentElement,"
                 + "{subtree:true,childList:true,attributes:true,attributeFilter:['content','name']});}"
@@ -325,10 +947,11 @@ public final class WebSourceView extends FrameLayout {
 
     private void scheduleDesktopViewport(long delayMillis) {
         final int expectedRequestId = requestId;
+        final WebView expectedView = webView;
         postDelayed(new Runnable() {
             @Override
             public void run() {
-                if (pageActive && requestId == expectedRequestId && !destroyed) {
+                if (expectedView == webView && pageActive && requestId == expectedRequestId && !destroyed) {
                     applyDesktopViewport();
                 }
             }
@@ -337,25 +960,170 @@ public final class WebSourceView extends FrameLayout {
 
     private float cssInitialScale() {
         float density = getResources().getDisplayMetrics().density;
-        return density > 0f ? 1f / density : 1f;
+        int physicalWidth = getWidth();
+        float baseScale = density > 0f ? 1f / density : 1f;
+        if (physicalWidth > 0 && viewportWidth > 0 && density > 0f) {
+            baseScale = physicalWidth / (density * viewportWidth);
+        }
+        return baseScale * effectivePageScale();
+    }
+
+    private float effectivePageScale() {
+        return currentPageScale;
     }
 
     private int cssInitialScalePercent() {
-        return Math.max(1, Math.round(cssInitialScale() * 100f));
+        // Unlike meta viewport initial-scale, WebView.setInitialScale is expressed
+        // in physical pixels. Account for the real WebView width now that its
+        // backing layer is no longer stretched with a View transform.
+        int physicalWidth = getWidth();
+        float physicalScale = physicalWidth > 0 && viewportWidth > 0
+                ? physicalWidth / (float) viewportWidth : 1f;
+        return Math.max(1, Math.round(physicalScale * effectivePageScale() * 100f));
     }
 
     void applyConfiguration(String requestedViewportMode, boolean requestedLoadImages,
-            String requestedUserAgentMode) {
-        String nextMode = "2k".equals(requestedViewportMode)
+            String requestedUserAgentMode, float requestedPageScale) {
+        applyConfiguration(requestedViewportMode, requestedLoadImages,
+                requestedUserAgentMode, "native", requestedPageScale, true, false, false, "[]");
+    }
+
+    void applyConfiguration(String requestedViewportMode, boolean requestedLoadImages,
+            String requestedUserAgentMode, String requestedBrowserVersionMode,
+            float requestedPageScale) {
+        applyConfiguration(requestedViewportMode, requestedLoadImages,
+                requestedUserAgentMode, requestedBrowserVersionMode, requestedPageScale,
+                true, false, false, "[]");
+    }
+
+    private void updateToolbarHeight(int heightDp) {
+        int next = Math.round(heightDp * getResources().getDisplayMetrics().density);
+        if (next == tabBarHeight) return;
+        tabBarHeight = next;
+        LayoutParams toolbar = (LayoutParams) tabBar.getLayoutParams();
+        toolbar.height = tabBarHeight;
+        tabBar.setLayoutParams(toolbar);
+        updateDesktopViewport(getWidth(), getHeight());
+        requestLayout();
+        if (pageActive) scheduleDesktopViewport(120L);
+    }
+
+    private void setBrowserFullscreen(boolean enabled) {
+        if (browserFullscreen == enabled) return;
+        browserFullscreen = enabled;
+        tabBarHeight = enabled ? 0 : Math.round(tabBar.heightDp()
+                * getResources().getDisplayMetrics().density);
+        tabBar.setVisibility(enabled || !pageActive ? View.GONE : View.VISIBLE);
+        removeCallbacks(hideFullscreenExit);
+        fullscreenExitButton.setVisibility(View.GONE);
+        updateDesktopViewport(getWidth(), getHeight());
+        requestLayout();
+        if (pageActive) scheduleDesktopViewport(100L);
+    }
+
+    private void clampWebScrollToContent() {
+        if (webView == null || !pageActive || webView.getContentHeight() <= 0) return;
+        int maximum = Math.max(0,
+                Math.round(webView.getContentHeight() * webView.getScale()) - webView.getHeight());
+        int current = webView.getScrollY();
+        if (current < 0 || current > maximum) {
+            webView.scrollTo(webView.getScrollX(), Math.max(0, Math.min(current, maximum)));
+        }
+    }
+
+    void settleRemoteWebScroll() {
+        removeCallbacks(settleRemoteScroll);
+        post(settleRemoteScroll);
+        postDelayed(settleRemoteScroll, 120L);
+    }
+
+    boolean exitBrowserFullscreen() {
+        if (!browserFullscreen) return false;
+        setBrowserFullscreen(false);
+        return true;
+    }
+
+    private void applyActiveTabMute() {
+        if (webView == null || !pageActive || destroyed) return;
+        boolean muted = tabBar.activeMuted();
+        String script = "(function(){var m=" + (muted ? "true" : "false") + ";"
+                + "window.__ntvTabMuted=m;var q=document.querySelectorAll('audio,video');"
+                + "for(var i=0;i<q.length;i++){var e=q[i];if(m){if(!e.hasAttribute('data-ntv-muted'))"
+                + "e.setAttribute('data-ntv-muted',e.muted?'1':'0');e.muted=true;}else{"
+                + "if(e.getAttribute('data-ntv-muted')==='0')e.muted=false;e.removeAttribute('data-ntv-muted');}}"
+                + "if(window.__ntvMuteObserver){window.__ntvMuteObserver.disconnect();window.__ntvMuteObserver=null;}"
+                + "if(m&&document.documentElement){window.__ntvMuteObserver=new MutationObserver(function(){"
+                + "var a=document.querySelectorAll('audio:not([data-ntv-muted]),video:not([data-ntv-muted])');"
+                + "for(var j=0;j<a.length;j++){a[j].setAttribute('data-ntv-muted',a[j].muted?'1':'0');a[j].muted=true;}});"
+                + "window.__ntvMuteObserver.observe(document.documentElement,{childList:true,subtree:true});}})();";
+        if (Build.VERSION.SDK_INT >= 19) webView.evaluateJavascript(script, null);
+        else webView.loadUrl("javascript:" + script);
+    }
+
+    private void notifyBrowserPoliciesChanged() {
+        tabBar.setPolicies(loadImages, adBlockEnabled, webRtcEnabled);
+        if (listener != null) {
+            listener.onBrowserPoliciesChanged(loadImages, adBlockEnabled, webRtcEnabled);
+        }
+    }
+
+    private static boolean isSystemMouse(MotionEvent event) {
+        return event != null && event.getDeviceId() != 0
+                && (event.getSource() & android.view.InputDevice.SOURCE_MOUSE)
+                        == android.view.InputDevice.SOURCE_MOUSE;
+    }
+
+    private void runSystemMouseSelection(String operation, MotionEvent event) {
+        if (webView == null || Build.VERSION.SDK_INT < 19) return;
+        float nx = Math.max(0f, Math.min(1f, event.getX() / Math.max(1f, webView.getWidth())));
+        float ny = Math.max(0f, Math.min(1f, event.getY() / Math.max(1f, webView.getHeight())));
+        String script;
+        if ("end".equals(operation)) {
+            script = "window.__ntvMouseSelection&&window.__ntvMouseSelection.end();";
+        } else {
+            script = "window.__ntvMouseSelection&&window.__ntvMouseSelection." + operation + "("
+                    + String.format(Locale.US, "%.6f,%.6f", nx, ny) + ");";
+        }
+        webView.evaluateJavascript(script, null);
+    }
+
+    void applyConfiguration(String requestedViewportMode, boolean requestedLoadImages,
+            String requestedUserAgentMode, String requestedBrowserVersionMode,
+            float requestedPageScale, boolean requestedAdBlock, boolean requestedWebRtc,
+            boolean requestedUserScriptEnabled, String requestedUserScripts) {
+        String nextMode = "4k".equals(requestedViewportMode)
+                || "2k".equals(requestedViewportMode)
                 || "1080p".equals(requestedViewportMode)
                 ? requestedViewportMode : "720p";
         String nextUserAgentMode = sanitizeUserAgentMode(requestedUserAgentMode);
-        String nextUserAgent = userAgentForMode(nextUserAgentMode);
+        String nextBrowserVersionMode = sanitizeBrowserVersionMode(requestedBrowserVersionMode);
+        String nextUserAgent = userAgentForMode(nextUserAgentMode, nextBrowserVersionMode);
+        float nextPageScale = Math.max(0.5f, Math.min(3f, requestedPageScale));
+        boolean reloadPage = loadImages != requestedLoadImages
+                || !nextUserAgentMode.equals(userAgentMode)
+                || !nextBrowserVersionMode.equals(browserVersionMode)
+                || adBlockEnabled != requestedAdBlock || webRtcEnabled != requestedWebRtc
+                || userScriptEnabled != requestedUserScriptEnabled
+                || !safe(requestedUserScripts).equals(userScripts);
         boolean changed = !nextMode.equals(viewportMode) || loadImages != requestedLoadImages
-                || !nextUserAgentMode.equals(userAgentMode);
+                || !nextUserAgentMode.equals(userAgentMode)
+                || !nextBrowserVersionMode.equals(browserVersionMode)
+                || Math.abs(pageScale - nextPageScale) > 0.001f || reloadPage;
+        // A retained document cannot undo executed userscripts or WebRTC hooks.
+        // Preserve its history, but recreate it with the new policy on activation.
+        if (reloadPage) releaseRetainedWebViews(true);
         viewportMode = nextMode;
+        pageScale = nextPageScale;
+        currentPageScale = nextPageScale;
         loadImages = requestedLoadImages;
         userAgentMode = nextUserAgentMode;
+        browserVersionMode = nextBrowserVersionMode;
+        adBlockEnabled = requestedAdBlock;
+        if (adBlockEnabled) WebAdBlocker.refreshAsync(false);
+        webRtcEnabled = requestedWebRtc;
+        tabBar.setPolicies(loadImages, adBlockEnabled, webRtcEnabled);
+        userScriptEnabled = requestedUserScriptEnabled;
+        userScripts = safe(requestedUserScripts);
         activeUserAgent = nextUserAgent;
         if (webView != null) {
             WebSettings settings = webView.getSettings();
@@ -365,13 +1133,22 @@ public final class WebSourceView extends FrameLayout {
             webView.setInitialScale(cssInitialScalePercent());
         }
         updateDesktopViewport(getWidth(), getHeight());
+        updatePageScripts();
         if (changed && pageActive && webView != null) {
+            if (!reloadPage) {
+                // Browser zoom/window resizing preserves the document, forms and
+                // player state. Only loading-policy/UA changes require a reload.
+                applyDesktopViewport();
+                scheduleDesktopViewport(250L);
+                return;
+            }
             final int expectedRequestId = requestId;
+            final WebView expectedView = webView;
             webView.post(new Runnable() {
                 @Override
                 public void run() {
-                    if (pageActive && requestId == expectedRequestId && !destroyed) {
-                        setLoadingVisible(true);
+                    if (expectedView == webView && pageActive && requestId == expectedRequestId && !destroyed) {
+                        beginPageLoad(expectedView);
                         webView.setInitialScale(cssInitialScalePercent());
                         webView.reload();
                     }
@@ -384,25 +1161,286 @@ public final class WebSourceView extends FrameLayout {
         this.listener = listener;
     }
 
+    boolean isBrowserChromeTouch(MotionEvent event) {
+        if (event == null || !pageActive || tabBar.getVisibility() != View.VISIBLE) return false;
+        Rect bounds = new Rect();
+        return tabBar.getGlobalVisibleRect(bounds) && !bounds.isEmpty()
+                && bounds.contains(Math.round(event.getRawX()), Math.round(event.getRawY()));
+    }
+
+    boolean isBrowserNativeContextPoint(float screenX, float screenY) {
+        return pageActive && tabBar.containsNativeContextPoint(screenX, screenY);
+    }
+
+    boolean scrollBrowserChromeAt(float screenX, float screenY, int distanceX) {
+        return pageActive && tabBar.scrollBookmarkBarAt(screenX, screenY, distanceX);
+    }
+
+    /** Give the native edge control sole ownership of a pointer sequence. */
+
+    @Override public boolean dispatchTouchEvent(MotionEvent event) {
+        updateFullscreenExitForMouse(event);
+        if (event != null && event.getActionMasked() == MotionEvent.ACTION_DOWN
+                && pageActive && !false) {
+
+        }
+        return super.dispatchTouchEvent(event);
+    }
+
+    private String channelPageScript = "";
+
     void open(int newRequestId, String url) {
-        prepareFreshPage();
+        open(newRequestId, url, "");
+    }
+
+    void open(int newRequestId, String url, String pageScript) {
+        channelPageScript = pageScript == null ? "" : pageScript;
+        rendererRetries = 0;
+        if (tabBar.openChannel(url, "") == null) return;
+        openPage(newRequestId, url);
+    }
+
+    private void openPage(int newRequestId, String url) {
+        loadPage(newRequestId, url);
+    }
+
+    private void loadPage(int newRequestId, String url) {
+        if (destroyed) return;
+        WebTabBar.Tab targetTab = tabBar.active();
+        boolean switchingTabs = loadedTab != null && loadedTab != targetTab && webView != null;
+        boolean needsMemoryDecision = switchingTabs || !retainedTabWebViews.isEmpty();
+        boolean allowMultipleInstances = needsMemoryDecision && hasMemoryForAdditionalWebView();
+        boolean keepCurrentInstance = switchingTabs && allowMultipleInstances;
+        if (needsMemoryDecision && !allowMultipleInstances) {
+            // Reclaim previously retained renderers before starting another one.
+            // Their navigation state remains available through saveState().
+            releaseRetainedWebViews(true);
+        }
+        if (loadedTab != null && loadedTab != targetTab && webView != null) {
+            String currentUrl = webView.getUrl();
+            if (isWebPage(currentUrl)) loadedTab.url = currentUrl;
+            loadedTab.title = webView.getTitle();
+            if (loadedTab.sleeping) {
+                loadedTab.state = null;
+            } else if (keepCurrentInstance) {
+                loadedTab.state = null;
+                retainCurrentWebView(loadedTab);
+            } else {
+                loadedTab.state = new Bundle();
+                webView.saveState(loadedTab.state);
+            }
+        }
+        boolean reuseRetainedTab = targetTab != null && targetTab != loadedTab
+                && retainedTabWebViews.containsKey(targetTab);
+        boolean restoreTab = targetTab != null && targetTab != loadedTab
+                && targetTab.state != null && !reuseRetainedTab;
+        // Trackpad pinch zoom belongs to one opened channel only. Every channel
+        // entry starts from the configured browser scale again.
+        currentPageScale = pageScale;
+        if (reuseRetainedTab) {
+            pageActive = false;
+            requestId = -1;
+            resetGeneration++;
+            if (webView != null) destroyCurrentWebView();
+            if (!activateRetainedWebView(targetTab)) prepareFreshPage();
+        } else prepareFreshPage();
         requestId = newRequestId;
-        pageUrl = url;
+        String retainedUrl = reuseRetainedTab && webView != null ? webView.getUrl() : null;
+        pageUrl = isWebPage(retainedUrl) ? retainedUrl : url;
         discoveredStreamUrls.clear();
         pageActive = true;
-        clearInitialHistory = true;
+        clearInitialHistory = !restoreTab && !reuseRetainedTab;
         compatibilityInjectionCount = 0;
+        profileInjectionCount = 0;
+        pagePolicyInjectionCount = 0;
         resetGeneration++;
         setVisibility(View.VISIBLE);
         bringToFront();
-        setLoadingVisible(true);
-        webView.onResume();
+        tabBar.setVisibility(browserFullscreen ? View.GONE : View.VISIBLE);
+        if (!browserFullscreen) tabBar.bringToFront();
+        fullscreenExitButton.setVisibility(View.GONE);
+        updatePageScripts();
+
+        updatePageLifecycle();
         updateDesktopViewport(getWidth(), getHeight());
         webView.setInitialScale(cssInitialScalePercent());
-        webView.loadUrl(url);
+        resetResourcePage(pageUrl, reuseRetainedTab);
+        sourceClient.resetHttpsFallback();
+        loadedTab = targetTab;
+        if (reuseRetainedTab) {
+            setLoadingVisible(false);
+            tabBar.updateActive(pageUrl, webView.getTitle());
+            controllerPageTitle = safe(webView.getTitle());
+            applyActiveTabMute();
+            applyDesktopViewport();
+            if (listener != null) {
+                listener.onPageReady(requestId, pageUrl, webView.getTitle());
+            }
+        } else {
+            beginPageLoad(webView);
+        }
+        if (!reuseRetainedTab
+                && (!restoreTab || webView.restoreState(targetTab.state) == null)) {
+            webView.loadUrl(url);
+        }
+    }
+
+    private void navigateAddress(String value) {
+        if (webView == null || !pageActive || destroyed) return;
+        String target = normalizeAddress(value);
+        if (!isWebPage(target)) return;
+        channelPageScript = "";
+        rendererRetries = 0;
+        hideFullscreenView();
+        pageUrl = target;
+        tabBar.updateActive(target, null);
+        beginPageLoad(webView);
+        resetResourcePage(target);
+        sourceClient.resetHttpsFallback();
+        webView.loadUrl(target);
+    }
+
+    private static String normalizeAddress(String input) {
+        String value = input == null ? "" : input.trim();
+        if (value.length() == 0) return "";
+        String lower = value.toLowerCase(Locale.US);
+        if (lower.startsWith("http://") || lower.startsWith("https://")) return value;
+        if (value.startsWith("//")) return "https:" + value;
+        boolean looksLikeHost = value.indexOf(' ') < 0 && value.indexOf('\t') < 0
+                && (value.indexOf('.') > 0 || "localhost".equalsIgnoreCase(value)
+                    || value.matches("[0-9.]+(:[0-9]+)?(/.*)?"));
+        return looksLikeHost ? "https://" + value
+                : "https://www.baidu.com/s?wd=" + Uri.encode(value);
+    }
+
+    private void reloadPage() {
+        if (webView == null || !pageActive || destroyed) return;
+        hideFullscreenView();
+        beginPageLoad(webView);
+        webView.reload();
+    }
+
+    private void openCurrentInNewTab() {
+        String url = webView == null ? pageUrl : webView.getUrl();
+        if (!isWebPage(url)) return;
+        if (tabBar.openNew(url, webView == null ? "" : webView.getTitle()) == null) return;
+        openPage(requestId, url);
+    }
+
+    void openLinkInNewTab(String url) {
+        if (isUserScriptInstallUrl(url)) {
+            if (listener != null) listener.onBrowserUserScript(url);
+            return;
+        }
+        if (!isWebPage(url) || destroyed) return;
+        // If every tab is pinned, report the capacity limit without replacing the current page.
+        if (tabBar.openNew(url, "") == null) return;
+        rendererRetries = 0;
+        openPage(requestId, url);
+    }
+
+    private boolean queuePopupNavigation(final WebView opener, String value,
+            final WebView popup) {
+        final String url = value == null ? "" : value.trim();
+        if (!isWebPage(url)) return false;
+        post(new Runnable() {
+            @Override public void run() {
+                if (popup != null) {
+                    popup.stopLoading();
+                    popup.setWebViewClient(null);
+                    popup.destroy();
+                }
+                if (destroyed || opener != webView || !pageActive) return;
+                openLinkInNewTab(url);
+            }
+        });
+        return true;
+    }
+
+    private void loadBrowserTab(WebTabBar.Tab tab) {
+        if (tab == null || !isWebPage(tab.url) || destroyed) return;
+        channelPageScript = "";
+        rendererRetries = 0;
+        openPage(requestId, tab.url);
+    }
+
+    private boolean pinchViewportPosted;
+    private final Runnable applyPinchViewport = new Runnable() {
+        @Override public void run() {
+            pinchViewportPosted = false;
+            if (webView == null || !pageActive || destroyed) return;
+            webView.setInitialScale(cssInitialScalePercent());
+            updateDesktopProfile();
+            applyDesktopViewport();
+        }
+    };
+
+    void adjustCurrentPageScale(float factor) {
+        if (webView == null || !pageActive || destroyed
+                || Float.isNaN(factor) || Float.isInfinite(factor)) return;
+        float next = Math.max(0.5f, Math.min(3f, currentPageScale * factor));
+        if (next == currentPageScale) return;
+        currentPageScale = next;
+        if (!pinchViewportPosted) {
+            pinchViewportPosted = true;
+            postDelayed(applyPinchViewport, 16L);
+        }
+    }
+
+    private void onRendererGone(WebView failed, boolean crashed) {
+        if (failed != webView) {
+            WebTabBar.Tab failedTab = null;
+            for (Map.Entry<WebTabBar.Tab, WebView> entry : retainedTabWebViews.entrySet()) {
+                if (entry.getValue() == failed) {
+                    failedTab = entry.getKey();
+                    break;
+                }
+            }
+            if (failedTab != null) {
+                retainedTabWebViews.remove(failedTab);
+                failedTab.state = null;
+            }
+            return;
+        }
+        if (renderDiagnostics != null) renderDiagnostics.stop("rendererGone crashed=" + crashed);
+        final int failedRequest = requestId;
+        final String failedUrl = pageUrl;
+        final boolean visible = pageActive && isPageVisible();
+        webView = null;
+        desktopProfile = null;
+        pageScriptManager = null;
+        pageActive = false;
+
+        requestId = -1;
+        clearInitialHistory = false;
+        discoveredStreamUrls.clear();
+        final int generation = ++resetGeneration;
+        // The fullscreen callback is owned by the dead renderer; don't invoke it.
+        if (fullscreenView != null) removeView(fullscreenView);
+        fullscreenView = null;
+        fullscreenCallback = null;
+        setLoadingVisible(false);
+        if (!visible || destroyed) return;
+        boolean retry = rendererRetries++ < 1 && isWebPage(failedUrl);
+        if (listener != null) listener.onPageError(failedRequest, retry
+                ? "网页渲染进程已退出，正在尝试恢复"
+                : "网页连续崩溃，请切换频道或稍后重新打开");
+        if (!retry) return;
+        // Let all sibling WebViews acknowledge the old renderer before recreating.
+        postDelayed(new Runnable() {
+            @Override public void run() {
+                if (destroyed || generation != resetGeneration || webView != null) return;
+                if (!false && getWindowVisibility() != View.VISIBLE) return;
+                openPage(failedRequest, failedUrl);
+            }
+        }, 750L);
     }
 
     void closePage() {
+        dismissSmartContextPopup();
+        channelPageScript = "";
+        if (renderDiagnostics != null) renderDiagnostics.stop("closed");
+        hideFullscreenView();
         if (destroyed) {
             return;
         }
@@ -421,6 +1459,11 @@ public final class WebSourceView extends FrameLayout {
         discoveredStreamUrls.clear();
         if (webView == null) {
             setLoadingVisible(false);
+            tabBar.setVisibility(View.GONE);
+            fullscreenExitButton.setVisibility(View.GONE);
+            browserFullscreen = false;
+            tabBarHeight = Math.round(tabBar.heightDp()
+                    * getResources().getDisplayMetrics().density);
             setVisibility(View.GONE);
             return;
         }
@@ -429,14 +1472,19 @@ public final class WebSourceView extends FrameLayout {
         webView.clearHistory();
         webView.loadUrl("about:blank");
         webView.clearHistory();
-        webView.onPause();
+        tabBar.setVisibility(View.GONE);
+        fullscreenExitButton.setVisibility(View.GONE);
+        browserFullscreen = false;
+        tabBarHeight = Math.round(tabBar.heightDp()
+                * getResources().getDisplayMetrics().density);
         setVisibility(View.GONE);
+        updatePageLifecycle();
         // Loading about:blank can itself create a history entry on some old WebView
         // implementations, so clear once more after the navigation has settled.
         post(new Runnable() {
             @Override
             public void run() {
-                if (!pageActive && generation == resetGeneration) {
+                if (!destroyed && webView != null && !pageActive && generation == resetGeneration) {
                     webView.clearHistory();
                 }
             }
@@ -448,16 +1496,24 @@ public final class WebSourceView extends FrameLayout {
     }
 
     boolean hasRetainedPage() {
-        return !destroyed && pageActive && requestId >= 0;
+        return !destroyed && webView != null && pageActive && requestId >= 0;
+    }
+
+    boolean hasRetainedPage(int expectedRequestId) {
+        return hasRetainedPage() && requestId == expectedRequestId;
     }
 
     void hideForStreamPlayback() {
         if (!hasRetainedPage()) {
             return;
         }
+        dismissSmartContextPopup();
+        hideFullscreenView();
+        // onPause alone does not stop a late site play() from stealing IJK audio focus.
+        setMultimediaPaused(true);
         setLoadingVisible(false);
-        webView.onPause();
         setVisibility(View.GONE);
+        updatePageLifecycle();
     }
 
     boolean restoreAfterStreamPlayback() {
@@ -466,23 +1522,34 @@ public final class WebSourceView extends FrameLayout {
         }
         setVisibility(View.VISIBLE);
         bringToFront();
-        webView.onResume();
+        tabBar.setVisibility(browserFullscreen ? View.GONE : View.VISIBLE);
+        if (!browserFullscreen) tabBar.bringToFront();
+        fullscreenExitButton.setVisibility(View.GONE);
+        updatePageLifecycle();
+        setMultimediaPaused(false);
         webView.requestFocus();
         updateDesktopViewport(getWidth(), getHeight());
         return true;
     }
 
-    private String userAgentForMode(String mode) {
-        if ("macos".equals(mode)) {
-            return MACOS_USER_AGENT;
+    private String userAgentForMode(String mode, String versionMode) {
+        if (DesktopWebProfile.isDesktop(mode)) {
+            return DesktopWebProfile.userAgent(mode, browserUserAgent, versionMode);
         }
         if ("ipad".equals(mode)) {
-            return IPAD_USER_AGENT;
+            return DesktopWebProfile.ipadUserAgent(browserUserAgent, versionMode);
         }
         if ("native".equals(mode)) {
             return browserUserAgent;
         }
         return WINDOWS_USER_AGENT;
+    }
+
+    private void updateDesktopProfile() {
+        if (desktopProfile != null) {
+            desktopProfile.update(userAgentMode, browserUserAgent, browserVersionMode,
+                    viewportWidth, viewportHeight, effectivePageScale());
+        }
     }
 
     private static String sanitizeUserAgentMode(String mode) {
@@ -492,9 +1559,23 @@ public final class WebSourceView extends FrameLayout {
         return "windows";
     }
 
+    private static String sanitizeBrowserVersionMode(String mode) {
+        if ("118".equals(mode) || "128".equals(mode) || "138".equals(mode)) {
+            return mode;
+        }
+        return "native";
+    }
+
     boolean goBackIfPossible() {
-        if (!isPageVisible() || destroyed || !pageActive) {
+        if (webView == null || !isPageVisible() || destroyed || !pageActive) {
             return false;
+        }
+        if (fullscreenView != null) {
+            final View exiting = fullscreenView;
+            WebFullscreenCompatibility.beforeNativeExit(webView, () -> {
+                if (fullscreenView == exiting) hideFullscreenView();
+            });
+            return true;
         }
         WebBackForwardList history = webView.copyBackForwardList();
         int currentIndex = history == null ? -1 : history.getCurrentIndex();
@@ -502,9 +1583,25 @@ public final class WebSourceView extends FrameLayout {
         if (targetIndex < 0) {
             return false;
         }
-        setLoadingVisible(true);
+        beginPageLoad(webView);
         webView.goBackOrForward(targetIndex - currentIndex);
         return true;
+    }
+
+    boolean goForwardIfPossible() {
+        if (webView == null || !isPageVisible() || destroyed || !pageActive) return false;
+        WebBackForwardList history = webView.copyBackForwardList();
+        if (history == null) return false;
+        for (int index = history.getCurrentIndex() + 1; index < history.getSize(); index++) {
+            WebHistoryItem item = history.getItemAtIndex(index);
+            if (item != null && isWebPage(item.getUrl())) {
+                hideFullscreenView();
+                beginPageLoad(webView);
+                webView.goBackOrForward(index - history.getCurrentIndex());
+                return true;
+            }
+        }
+        return false;
     }
 
     private static int previousWebPageIndex(WebBackForwardList history, int currentIndex) {
@@ -520,8 +1617,24 @@ public final class WebSourceView extends FrameLayout {
         return -1;
     }
 
+    private void hideFullscreenView() {
+        if (fullscreenView == null) return;
+        View previous = fullscreenView;
+        WebChromeClient.CustomViewCallback callback = fullscreenCallback;
+        fullscreenView = null;
+        fullscreenCallback = null;
+        removeView(previous);
+        if (webView != null) {
+            webView.setVisibility(View.VISIBLE);
+            webView.requestFocus();
+        }
+        if (callback != null) callback.onCustomViewHidden();
+    }
+
     void setInterfaceScale(float scale) {
-        float safeScale = Math.max(0.9f, Math.min(2f, scale));
+        loadingInterfaceScale = Math.max(0.9f, Math.min(2f, scale));
+        float safeScale = loadingInterfaceScale
+                * Math.max(0.5f, Math.min(1f, viewportWidth / (float) VIEWPORT_4K_WIDTH));
         // Resize each native element instead of scaling a pre-rendered card. Scaling the
         // whole hierarchy makes text and the spinner visibly soft on 4K televisions.
         loadingOverlay.setScaleX(1f);
@@ -529,14 +1642,8 @@ public final class WebSourceView extends FrameLayout {
         applyLoadingOverlayMetrics(loadingOverlay, safeScale);
     }
 
-    void scrollByRemote(int deltaY) {
-        if (isPageVisible()) {
-            webView.scrollBy(0, deltaY);
-        }
-    }
-
     void dispatchRemoteKey(int keyCode, int metaState) {
-        if (!isPageVisible()) {
+        if (webView == null || !isPageVisible()) {
             return;
         }
         webView.requestFocus();
@@ -548,7 +1655,7 @@ public final class WebSourceView extends FrameLayout {
     }
 
     void inputTextRemote(String text) {
-        if (!isPageVisible() || text == null || text.length() == 0) {
+        if (webView == null || !isPageVisible() || text == null || text.length() == 0) {
             return;
         }
         String script = "(function(t){var e=document.activeElement;if(!e||e===document.body)"
@@ -579,14 +1686,53 @@ public final class WebSourceView extends FrameLayout {
             webView.clearCache(true);
             webView.clearHistory();
             webView.clearFormData();
+        } else {
+            // clearCache() is process-wide but requires an instance. Creating one
+            // here is acceptable because this path only runs after an explicit
+            // user action, while normal native-channel startup remains lazy.
+            WebView cleaner = null;
+            try {
+                cleaner = new WebView(getContext());
+                cleaner.clearCache(true);
+                cleaner.clearFormData();
+            } catch (RuntimeException error) {
+                Log.w(TAG, "Unable to initialize WebView cache cleaner", error);
+            } finally {
+                if (cleaner != null) cleaner.destroy();
+            }
         }
         android.webkit.WebStorage.getInstance().deleteAllData();
+        deleteObsoleteProxyCache(new File(getContext().getCacheDir(), "browser"));
+        cachedBrowserCacheBytes = 0L;
+        browserCacheMeasuredAt = android.os.SystemClock.elapsedRealtime();
     }
 
-    long browserCacheSizeBytes() {
-        long bytes = measureFiles(getContext().getCacheDir(), true);
+    synchronized long browserCacheSizeBytes() {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (browserCacheMeasuredAt > 0L && now - browserCacheMeasuredAt < 30000L) {
+            return cachedBrowserCacheBytes;
+        }
         File webViewData = getContext().getDir("webview", Context.MODE_PRIVATE);
-        return bytes + measureFiles(webViewData, false);
+        File cacheRoot = getContext().getCacheDir();
+        cachedBrowserCacheBytes = measureFiles(webViewData, false)
+                + measureFiles(new File(cacheRoot, "webview"), true)
+                + measureFiles(new File(cacheRoot, "WebView"), true)
+                + measureFiles(new File(cacheRoot, "webviewCacheChromium"), true);
+        browserCacheMeasuredAt = now;
+        return cachedBrowserCacheBytes;
+    }
+
+    boolean cancelRemoteMouseButton(MotionEvent release) {
+        if (webView == null || !pageActive) return false;
+        // Chromium ignores ACTION_CANCEL for mouse input. Release outside the
+        // document so JS drag handlers receive mouseup without clicking the
+        // previously pressed control. Direct dispatch keeps the old mouse target
+        // even when the cursor has left its bounds (ViewGroup would hit-test it away).
+        MotionEvent outside = MotionEvent.obtain(release);
+        outside.setLocation(-1f, -1f);
+        try { webView.dispatchGenericMotionEvent(outside); }
+        finally { outside.recycle(); }
+        return true;
     }
 
     String browserUserAgent() {
@@ -612,16 +1758,268 @@ public final class WebSourceView extends FrameLayout {
         return total;
     }
 
-    void resumePage() {
-        if (isPageVisible()) {
-            webView.onResume();
+    private void updatePageScripts() {
+        boolean blockAds = adBlockEnabled && tabBar.activeAdBlockEnabled();
+        if (sourceClient != null) {
+            sourceClient.requestAdBlockEnabled = blockAds;
+            sourceClient.mainDocumentUrl = pageUrl;
+        }
+        if (pageScriptManager != null) {
+            pageScriptManager.update(blockAds, webRtcEnabled,
+                    userScriptEnabled, userScripts);
         }
     }
 
-    void pausePage() {
-        if (isPageVisible()) {
-            webView.onPause();
+    interface SmartContextCallback { void onResult(JSONObject result); }
+
+    void inspectSmartContext(float screenX, float screenY,
+            final SmartContextCallback callback) {
+        if (callback == null) return;
+        if (webView == null || !pageActive || !isPageVisible() || destroyed) {
+            callback.onResult(new JSONObject());
+            return;
         }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT) {
+            callback.onResult(hitTestContext());
+            return;
+        }
+        int[] location = new int[2];
+        webView.getLocationOnScreen(location);
+        float shownWidth = Math.max(1f, webView.getWidth() * webView.getScaleX());
+        float shownHeight = Math.max(1f, webView.getHeight() * webView.getScaleY());
+        if (screenX < location[0] || screenY < location[1]
+                || screenX >= location[0] + shownWidth
+                || screenY >= location[1] + shownHeight) {
+            callback.onResult(new JSONObject());
+            return;
+        }
+        float x = Math.max(0f, Math.min(1f, (screenX - location[0]) / shownWidth));
+        float y = Math.max(0f, Math.min(1f, (screenY - location[1]) / shownHeight));
+        String script = "(function(nx,ny){var x=nx*window.innerWidth,y=ny*window.innerHeight,"
+                + "e=document.elementFromPoint(x,y),a=null,img=null,n=e,i=0;"
+                + "while(n&&i++<12){var tag=(n.tagName||'').toLowerCase();"
+                + "if(!img&&tag==='img')img=n;if(!a&&tag==='a')a=n;"
+                + "n=n.parentElement;}var image=img?(img.currentSrc||img.src||''):'',"
+                + "link=a?(a.href||''):'',title=(a&&(a.title||a.textContent)||"
+                + "img&&(img.alt||img.title)||'').trim(),selection='';"
+                + "try{selection=String(window.getSelection?window.getSelection():'').trim()}catch(z){}"
+                + "return JSON.stringify({"
+                + "kind:image&&link?'image-link':image?'image':link?'link':'none',"
+                + "imageUrl:image,linkUrl:link,title:title.slice(0,160),"
+                + "selection:selection.slice(0,4000)});})("
+                + String.format(Locale.US, "%.6f,%.6f", x, y) + ");";
+        final WebView inspectedView = webView;
+        final long inspectedNavigation = resourceNavigation;
+        if (Build.VERSION.SDK_INT >= 19) inspectedView.evaluateJavascript(script, new ValueCallback<String>() {
+            @Override public void onReceiveValue(String value) {
+                if (inspectedView != webView || inspectedNavigation != resourceNavigation
+                        || !pageActive || destroyed) {
+                    callback.onResult(new JSONObject());
+                    return;
+                }
+                try {
+                    String decoded = new JSONArray("[" + value + "]").optString(0, "{}");
+                    callback.onResult(new JSONObject(decoded));
+                } catch (Exception error) {
+                    callback.onResult(hitTestContext());
+                }
+            }
+        });
+    }
+
+    private void showSystemMouseContext(final float screenX, final float screenY) {
+        inspectSmartContext(screenX, screenY, new SmartContextCallback() {
+            @Override public void onResult(JSONObject result) {
+                if (destroyed || !pageActive) return;
+                showSmartContextPopup(screenX, screenY, result == null ? new JSONObject() : result);
+            }
+        });
+    }
+
+    void showSmartContextAt(float screenX, float screenY) {
+        showSystemMouseContext(screenX, screenY);
+    }
+
+    private void showSmartContextPopup(float screenX, float screenY, JSONObject context) {
+        dismissSmartContextPopup();
+        final String imageUrl = context.optString("imageUrl", "").trim();
+        final String linkUrl = context.optString("linkUrl", "").trim();
+        final String selection = context.optString("selection", "").trim();
+        LinearLayout menu = new LinearLayout(getContext());
+        menu.setOrientation(LinearLayout.VERTICAL);
+        menu.setPadding(dp(5), dp(5), dp(5), dp(5));
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(0xfff8f9fa);
+        background.setCornerRadius(dp(10));
+        background.setStroke(dp(1), 0xffd8dce1);
+        menu.setBackgroundDrawable(background);
+
+        if (Build.VERSION.SDK_INT >= 21) menu.setElevation(dp(8));
+        if (selection.length() > 0) {
+            addSmartContextAction(menu, "复制所选文字", new Runnable() {
+                @Override public void run() { copyToClipboard("网页文字", selection, "文字已复制"); }
+            });
+            addSmartContextAction(menu, "使用 Bing 搜索", new Runnable() {
+                @Override public void run() {
+                    String query = selection.length() > 512 ? selection.substring(0, 512) : selection;
+                    openLinkInNewTab("https://www.bing.com/search?q=" + Uri.encode(query));
+                }
+            });
+        }
+        if (linkUrl.length() > 0) {
+            addSmartContextAction(menu, "在新标签打开", new Runnable() {
+                @Override public void run() { openLinkInNewTab(linkUrl); }
+            });
+            addSmartContextAction(menu, "复制链接", new Runnable() {
+                @Override public void run() { copyToClipboard("网页链接", linkUrl, "链接已复制"); }
+            });
+        }
+        if (imageUrl.length() > 0) {
+            addSmartContextAction(menu, "下载图片", new Runnable() {
+                @Override public void run() {
+                    if (listener != null) listener.onBrowserDownloadImage(imageUrl);
+                }
+            });
+            addSmartContextAction(menu, "标记为广告", new Runnable() {
+                @Override public void run() {
+                    boolean added = markImageAsAd(imageUrl);
+                    Toast.makeText(getContext(), added ? "已标记为广告" : "该图片已在广告规则中",
+                            Toast.LENGTH_SHORT).show();
+                }
+            });
+        }
+        if (menu.getChildCount() == 0) return;
+        int width = dp(228);
+        int estimatedHeight = menu.getChildCount() * dp(44) + dp(10);
+        int[] location = new int[2];
+        getLocationOnScreen(location);
+        int pointerX = Math.round(screenX) - location[0];
+        int pointerY = Math.round(screenY) - location[1];
+        int gap = dp(10);
+        int x = pointerX + gap;
+        if (x + width > getWidth() - gap) x = pointerX - width - gap;
+        int y = pointerY + gap;
+        if (y + estimatedHeight > getHeight() - gap) y = pointerY - estimatedHeight - gap;
+        x = Math.max(gap, Math.min(x, Math.max(gap, getWidth() - width - gap)));
+        y = Math.max(gap, Math.min(y, Math.max(gap, getHeight() - estimatedHeight - gap)));
+
+        FrameLayout layer = new FrameLayout(getContext());
+        layer.setClickable(true);
+        layer.setFocusableInTouchMode(true);
+        smartContextLayer = layer;
+        addView(layer, new FrameLayout.LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(width,
+                LayoutParams.WRAP_CONTENT);
+        params.leftMargin = x;
+        params.topMargin = y;
+        layer.addView(menu, params);
+        menu.setClickable(true);
+        layer.setOnClickListener(v -> dismissSmartContextPopup());
+        layer.setOnKeyListener((v, keyCode, event) -> {
+            if (keyCode == KeyEvent.KEYCODE_BACK && event.getAction() == KeyEvent.ACTION_UP) {
+                dismissSmartContextPopup();
+                return true;
+            }
+            return false;
+        });
+        layer.requestFocus();
+        if (listener != null) listener.onBrowserOverlayShown();
+    }
+
+    private void addSmartContextAction(LinearLayout menu, String label, final Runnable action) {
+        TextView item = new TextView(getContext());
+        item.setText(label);
+        item.setTextColor(0xff202124);
+        item.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
+        item.setGravity(Gravity.CENTER_VERTICAL);
+        item.setPadding(dp(14), 0, dp(14), 0);
+        item.setBackgroundResource(android.R.drawable.list_selector_background);
+        item.setOnClickListener(v -> {
+            dismissSmartContextPopup();
+            action.run();
+        });
+        menu.addView(item, new LinearLayout.LayoutParams(
+                LayoutParams.MATCH_PARENT, dp(44)));
+    }
+
+    private void dismissSmartContextPopup() {
+        FrameLayout layer = smartContextLayer;
+        smartContextLayer = null;
+        if (layer != null && layer.getParent() == this) removeView(layer);
+    }
+
+    private void copyToClipboard(String label, String value, String message) {
+        ClipboardManager clipboard = (ClipboardManager)
+                getContext().getSystemService(Context.CLIPBOARD_SERVICE);
+        if (clipboard == null) return;
+        clipboard.setPrimaryClip(ClipData.newPlainText(label, value));
+        Toast.makeText(getContext(), message, Toast.LENGTH_SHORT).show();
+        if (listener != null) listener.onBrowserClipboard(value, message);
+    }
+
+    private JSONObject hitTestContext() {
+        JSONObject result = new JSONObject();
+        if (webView == null) return result;
+        WebView.HitTestResult hit = webView.getHitTestResult();
+        if (hit == null || hit.getExtra() == null) return result;
+        try {
+            int type = hit.getType();
+            if (type == WebView.HitTestResult.IMAGE_TYPE
+                    || type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE) {
+                result.put("kind", "image").put("imageUrl", hit.getExtra());
+            } else if (type == WebView.HitTestResult.ANCHOR_TYPE
+                    || type == WebView.HitTestResult.SRC_ANCHOR_TYPE) {
+                result.put("kind", "link").put("linkUrl", hit.getExtra());
+            }
+        } catch (Exception ignored) { }
+        return result;
+    }
+
+    boolean markImageAsAd(String url) {
+        if (!WebAdBlocker.markAsAd(getContext(), url)) return false;
+        if (webView != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            String script = "(function(u){var a=document.images;for(var i=0;i<a.length;i++)"
+                    + "if((a[i].currentSrc||a[i].src)===u)a[i].style.setProperty"
+                    + "('display','none','important');})(" + JSONObject.quote(url) + ");";
+            webView.evaluateJavascript(script, null);
+        }
+        return true;
+    }
+
+    String activeUserAgent() { return activeUserAgent; }
+    String activePageUrl() { return pageUrl; }
+
+    private static String safe(String value) { return value == null ? "" : value; }
+
+    private static void deleteObsoleteProxyCache(File file) {
+        if (file == null || !file.exists()) return;
+        if (file.isDirectory()) {
+            File[] children = file.listFiles();
+            if (children != null) {
+                for (File child : children) deleteObsoleteProxyCache(child);
+            }
+        }
+        file.delete();
+    }
+
+    void resumePage() {
+        hostResumed = true;
+        updatePageLifecycle();
+    }
+
+    String currentPageUrl() {
+        if (!hasRetainedPage()) return "";
+        String current = webView == null ? null : webView.getUrl();
+        if (current == null || !(current.startsWith("https://") || current.startsWith("http://"))) current = pageUrl;
+        return current != null && (current.startsWith("https://") || current.startsWith("http://")) ? current : "";
+    }
+
+    void pausePage() {
+        // Remember this even without a page: background channel changes must
+        // inherit the session lifecycle, not unconditionally resume a new page.
+        hostResumed = false;
+        updatePageLifecycle();
     }
 
     void destroyPage() {
@@ -632,10 +2030,36 @@ public final class WebSourceView extends FrameLayout {
         resetGeneration++;
         setLoadingVisible(false);
         destroyCurrentWebView();
+        releaseRetainedWebViews(false);
+        loadedTab = null;
     }
 
-    private void observeResource(String url) {
-        if (!pageActive || requestId < 0) {
+    private void resetResourcePage(String url) {
+        resetResourcePage(url, false);
+    }
+
+    // Called on the UI thread. Retained documents keep their resource identity;
+    // reloads and new documents must never inherit another document's resources.
+    String currentResourcePageKey() { return resourcePageKey; }
+    String currentPageTitle() { return controllerPageTitle.length() > 0 ? controllerPageTitle : safe(pageUrl); }
+
+    private void resetResourcePage(String url, boolean restore) {
+        synchronized (discoveredStreamUrls) {
+            resourceNavigation++;
+            discoveredStreamUrls.clear();
+        }
+        WebTabBar.Tab tab = tabBar.active();
+        if (tab != null) {
+            if (!restore || tab.resourceRevision == 0) tab.resourceRevision = resourceNavigation;
+            resourcePageKey = tab.id + ":" + tab.resourceRevision;
+        } else resourcePageKey = "";
+        if (!restore) controllerPageTitle = "";
+        if (listener != null) listener.onResourcesReset(requestId, url);
+    }
+
+    private void observeResource(final WebView origin, final SourceClient client, String url) {
+        final long observedNavigation = resourceNavigation;
+        if (origin != webView || client != sourceClient || !pageActive || requestId < 0) {
             return;
         }
         final String streamUrl = normalizeMediaPlaylist(url);
@@ -644,14 +2068,21 @@ public final class WebSourceView extends FrameLayout {
         }
         final int observedRequestId = requestId;
         final String observedUrl = streamUrl;
+        // Reserve before posting: repeated manifests and resource-heavy pages must
+        // not flood the main queue or grow an unbounded deduplication set.
+        synchronized (discoveredStreamUrls) {
+            if (origin != webView || client != sourceClient || !pageActive
+                    || observedNavigation != resourceNavigation
+                    || observedRequestId != requestId || discoveredStreamUrls.size() >= 30
+                    || !discoveredStreamUrls.add(observedUrl)) return;
+        }
         post(new Runnable() {
             @Override
             public void run() {
-                if (observedRequestId != requestId || listener == null
-                        || discoveredStreamUrls.contains(observedUrl)) {
+                if (destroyed || !pageActive || origin != webView || client != sourceClient
+                        || observedRequestId != requestId || observedNavigation != resourceNavigation || listener == null) {
                     return;
                 }
-                discoveredStreamUrls.add(observedUrl);
                 String currentPage = webView.getUrl();
                 if (currentPage == null || currentPage.startsWith("about:")) {
                     currentPage = pageUrl;
@@ -671,13 +2102,24 @@ public final class WebSourceView extends FrameLayout {
         if (!lower.startsWith("http://") && !lower.startsWith("https://")) {
             return null;
         }
+        // Match complete media files, not TS/M4S segments or URLs embedded in page queries.
+        int pathEnd = lower.indexOf('?');
+        int fragment = lower.indexOf('#');
+        if (pathEnd < 0 || (fragment >= 0 && fragment < pathEnd)) pathEnd = fragment;
+        String path = pathEnd < 0 ? lower : lower.substring(0, pathEnd);
+        if (path.endsWith(".mp4") || path.endsWith(".webm") || path.endsWith(".mkv")
+                || path.endsWith(".mov") || path.endsWith(".flv")
+                || path.endsWith(".mp3") || path.endsWith(".m4a") || path.endsWith(".flac")
+                || path.endsWith(".wav") || path.endsWith(".ogg") || path.endsWith(".oga")
+                || path.endsWith(".opus")) return url;
         int query = lower.indexOf('?');
         int playlist = lower.indexOf(".m3u8");
         if (playlist >= 0 && (query < 0 || playlist < query)) {
             return url;
         }
-        String decoded = decodeUrl(url);
-        String decodedLower = decoded.toLowerCase(Locale.US);
+        if (query < 0) return null;
+        String decoded = url.indexOf('%') < 0 ? url : decodeUrl(url);
+        String decodedLower = decoded == url ? lower : decoded.toLowerCase(Locale.US);
         int marker = decodedLower.indexOf("streamurl=");
         if (marker >= 0) {
             int start = marker + "streamurl=".length();
@@ -690,9 +2132,8 @@ public final class WebSourceView extends FrameLayout {
                 return nested;
             }
         }
-        return lower.indexOf(".m3u8") >= 0
-                || lower.indexOf("format=m3u8") >= 0
-                || lower.indexOf("type=m3u8") >= 0 ? url : null;
+        // A media URL inside an analytics query is not itself a playable resource.
+        return HLS_QUERY.matcher(lower).matches() ? url : null;
     }
 
     private static String decodeUrl(String value) {
@@ -703,32 +2144,137 @@ public final class WebSourceView extends FrameLayout {
         }
     }
 
+    private static String normalizedDocument(String url) {
+        if (url == null) return "";
+        int fragment = url.indexOf('#');
+        return fragment < 0 ? url : url.substring(0, fragment);
+    }
+
+    private static boolean sameDocument(String first, String second) {
+        return normalizedDocument(first).equals(normalizedDocument(second));
+    }
+
+    private static WebResourceResponse blockedResponse() {
+        return new WebResourceResponse("text/plain", "UTF-8",
+                new ByteArrayInputStream(new byte[0]));
+    }
+
     private final class SourceClient extends WebViewClient {
+        // Interception runs off the UI thread: never inspect Views or mutable Tab state there.
+        private volatile boolean requestAdBlockEnabled;
+        private volatile String mainDocumentUrl;
+        private String fallbackDocument;
+        private String fallbackCookies;
+        private String attemptedFallback;
+        private boolean fallbackRetryActive;
+        private boolean fallbackExhausted;
+
+        synchronized void resetHttpsFallback() {
+            fallbackDocument = null;
+            fallbackCookies = null;
+            attemptedFallback = null;
+            fallbackRetryActive = false;
+            fallbackExhausted = false;
+        }
+
+        private synchronized void armHttpsFallback(String url, String cookies) {
+            fallbackDocument = normalizedDocument(url);
+            fallbackCookies = cookies == null ? "" : cookies;
+        }
+
+        private synchronized String claimHttpsFallback(String url) {
+            if (!normalizedDocument(url).equals(fallbackDocument)) return null;
+            fallbackDocument = null;
+            String cookies = fallbackCookies;
+            fallbackCookies = null;
+            return cookies == null ? "" : cookies;
+        }
+
+        private boolean retryHttpsWithLegacyClient(final WebView view, String url) {
+            final String target = normalizedDocument(url);
+            if (!LegacyWebHttp.enabled() || !target.startsWith("https://")
+                    || !isCurrentDocument(view, target)) return false;
+            synchronized (this) {
+                if (target.equals(attemptedFallback)) return false;
+                attemptedFallback = target;
+                fallbackRetryActive = true;
+                fallbackExhausted = false;
+            }
+            // CookieManager stays on WebView's callback thread. The intercept
+            // thread only consumes this snapshot, avoiding KitKat deadlocks.
+            armHttpsFallback(target, CookieManager.getInstance().getCookie(target));
+            Log.i(TAG, "Retry legacy HTTPS document after WebView error: " + target);
+            view.stopLoading();
+            view.post(() -> {
+                if (this == sourceClient && view == webView && pageActive) view.loadUrl(target);
+            });
+            return true;
+        }
+
+        private boolean isCurrentDocument(WebView view, String url) {
+            String current = normalizedDocument(view == null ? null : view.getUrl());
+            String opened = normalizedDocument(pageUrl);
+            return url.equals(current) || url.equals(opened);
+        }
+
         @Override
         public boolean shouldOverrideUrlLoading(WebView view, String url) {
-            if (!pageActive || requestId < 0 || url == null) {
+            return handleNavigationOverride(view, url);
+        }
+
+        @TargetApi(21)
+        @Override
+        public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+            Uri uri = request == null ? null : request.getUrl();
+            return handleNavigationOverride(view, uri == null ? null : uri.toString());
+        }
+
+        private boolean handleNavigationOverride(WebView view, String url) {
+            if (this != sourceClient || view != webView || !pageActive || requestId < 0 || url == null) {
                 return false;
+            }
+            if (isUserScriptInstallUrl(url)) {
+                if (listener != null) listener.onBrowserUserScript(url);
+                return true;
             }
             String lower = url.toLowerCase(Locale.US);
             if (!lower.startsWith("http://") && !lower.startsWith("https://")) {
                 return false;
             }
-            // Keep redirects and links inside the same TV WebView. This also covers a
-            // source whose landing page later moves to a site-specific route.
-            pageUrl = url;
-            view.loadUrl(url);
-            return true;
+            // Let WebView commit links and redirects itself. Reissuing loadUrl here
+            // cancels the original navigation and replaces its history semantics.
+            // onPageStarted updates pageUrl when the navigation actually commits.
+            return false;
         }
 
         @Override
         public void onPageStarted(WebView view, String url, Bitmap favicon) {
-            if (!pageActive || requestId < 0 || isBlankPage(url)) {
+            if (this != sourceClient || view != webView || !pageActive || requestId < 0 || isBlankPage(url)) {
                 return;
             }
+            // Reused WebViews can deliver queued events from the document that
+            // loadUrl just replaced, including to the newly assigned client.
+            if (!url.equals(view.getUrl())) return;
             pageUrl = url;
+            tabBar.updateActive(url, null);
+            updatePageScripts();
+            if (favicon != null) tabBar.updateActiveIcon(favicon);
+            resetResourcePage(url);
             compatibilityInjectionCount = 0;
-            setLoadingVisible(true);
+            profileInjectionCount = 0;
+            pagePolicyInjectionCount = 0;
+            WebFullscreenCompatibility.apply(view);
+            WebAudioCompatibility.apply(view);
+            applyActiveTabMute();
+            if (!isPageVisible()) setMultimediaPaused(true);
+            beginPageLoad(view);
             updateDesktopViewport(getWidth(), getHeight());
+            if (desktopProfile != null && !desktopProfile.hasDocumentStartProtection()) {
+                desktopProfile.applyToCurrentDocument();
+            }
+            if (pageScriptManager != null && !pageScriptManager.hasDocumentStartScript()) {
+                pageScriptManager.applyToCurrentDocument();
+            }
             view.setInitialScale(cssInitialScalePercent());
             if (listener != null) {
                 listener.onPageStarted(requestId, url);
@@ -737,10 +2283,17 @@ public final class WebSourceView extends FrameLayout {
 
         @Override
         public void onPageFinished(WebView view, String url) {
-            if (!pageActive || requestId < 0 || isBlankPage(url)) {
+            if (this != sourceClient || view != webView || !pageActive || requestId < 0 || isBlankPage(url)) {
                 return;
             }
+            if (!url.equals(view.getUrl())) return;
             pageUrl = url;
+            Bitmap favicon = view.getFavicon();
+            if (favicon != null) tabBar.updateActiveIcon(favicon);
+            if (desktopProfile != null && DesktopWebProfile.isSpoofed(userAgentMode)) {
+                desktopProfile.applyToCurrentDocument();
+            }
+            if (pageScriptManager != null) pageScriptManager.applyToCurrentDocument();
             if (clearInitialHistory) {
                 // clearHistory() before loadUrl() cannot remove the current about:blank
                 // item on several vendor WebViews. Clear once the first real document
@@ -751,41 +2304,135 @@ public final class WebSourceView extends FrameLayout {
             applyDesktopViewport();
             scheduleDesktopViewport(250L);
             scheduleDesktopViewport(1000L);
-            setLoadingVisible(false);
-            if (listener != null) {
-                listener.onPageReady(requestId, url, view.getTitle());
+            WebFullscreenCompatibility.apply(view);
+            WebAudioCompatibility.apply(view);
+            // Ku9's jscode runs in the opened document, never in the resolver's
+            // hidden WebView. A document guard prevents duplicate finished events
+            // from installing repeated timers; close/open clears the channel script.
+            if (channelPageScript.length() > 0) {
+                String script = "(function(){if(window.__ntvKu9PageScript)return;"
+                        + "window.__ntvKu9PageScript=true;try{" + channelPageScript
+                        + "\n}catch(e){console.warn('Ku9 page script: '+e);}})();";
+                if (Build.VERSION.SDK_INT >= 19) view.evaluateJavascript(script, null);
+                else view.loadUrl("javascript:" + script);
+            }
+            if (!isPageVisible()) setMultimediaPaused(true);
+            completePageLoad(view, pageLoadGeneration, "page-finished");
+            synchronized (this) {
+                if (normalizedDocument(url).equals(attemptedFallback)) {
+                    fallbackRetryActive = false;
+                    fallbackExhausted = false;
+                }
             }
         }
 
         @Override
+        public void onPageCommitVisible(WebView view, String url) {
+            if (this != sourceClient || view != webView || !pageActive || requestId < 0) return;
+            if (desktopProfile != null && !desktopProfile.hasDocumentStartProtection()
+                    && DesktopWebProfile.isSpoofed(userAgentMode)) {
+                desktopProfile.applyToCurrentDocument();
+            }
+            probePageReady(view, pageLoadGeneration, 0L);
+        }
+
+        @Override
         public void onLoadResource(WebView view, String url) {
+            if (this != sourceClient || view != webView || !pageActive) return;
+            if (profileInjectionCount < 6 && desktopProfile != null
+                    && !desktopProfile.hasDocumentStartProtection()
+                    && DesktopWebProfile.isSpoofed(userAgentMode)) {
+                profileInjectionCount++;
+                desktopProfile.applyToCurrentDocument();
+            }
+            if (pagePolicyInjectionCount < 3 && pageScriptManager != null
+                    && !pageScriptManager.hasDocumentStartScript()) {
+                pagePolicyInjectionCount++;
+                pageScriptManager.applyToCurrentDocument();
+            }
             if (compatibilityInjectionCount < 3 && isJavascriptResource(url)) {
                 // onPageStarted can race with creation of the new document on old
                 // Chromium. Repeat immediately before the first scripts are executed.
                 injectJavascriptCompatibility(view);
             }
-            observeResource(url);
+            observeResource(view, this, url);
             super.onLoadResource(view, url);
         }
 
         @Override
         public WebResourceResponse shouldInterceptRequest(WebView view, String url) {
-            observeResource(url);
-            WebResourceResponse compatible = interceptCompatibilityBundle(url);
-            if (compatible != null) {
-                return compatible;
+            if (requestAdBlockEnabled && !sameDocument(url, mainDocumentUrl)
+                    && WebAdBlocker.shouldBlock(url)) return blockedResponse();
+            if (this != sourceClient || view != webView || !pageActive) return null;
+            observeResource(view, this, url);
+            String cookies = claimHttpsFallback(url);
+            if (cookies != null) {
+                return LegacyWebHttp.intercept(url, activeUserAgent, cookies,
+                        (cookieUrl, value) -> view.post(() -> CookieManager.getInstance()
+                                .setCookie(cookieUrl, value)),
+                        target -> view.post(() -> {
+                            if (this != sourceClient || view != webView || !pageActive
+                                    || !url.equals(view.getUrl())) return;
+                            armHttpsFallback(target,
+                                    CookieManager.getInstance().getCookie(target));
+                            view.loadUrl(target);
+                        }));
             }
-            return super.shouldInterceptRequest(view, url);
+            return null;
+        }
+
+        @TargetApi(21)
+        @Override
+        public WebResourceResponse shouldInterceptRequest(WebView view,
+                WebResourceRequest request) {
+            if (request == null) return null;
+            String url = request.getUrl() == null ? null : request.getUrl().toString();
+            if (requestAdBlockEnabled && !request.isForMainFrame()
+                    && WebAdBlocker.shouldBlock(url)) return blockedResponse();
+            if (this != sourceClient || view != webView || !pageActive) {
+                return null;
+            }
+            observeResource(view, this, url);
+            return null;
+        }
+
+        @Override
+        public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
+            String failingUrl = error == null ? null : error.getUrl();
+            if (this == sourceClient && view == webView && pageActive && requestId >= 0
+                    && retryHttpsWithLegacyClient(view, failingUrl)) {
+                handler.cancel();
+                return;
+            }
+            synchronized (this) {
+                if (normalizedDocument(failingUrl).equals(attemptedFallback)) {
+                    fallbackExhausted = true;
+                }
+            }
+            super.onReceivedSslError(view, handler, error);
         }
 
         @Override
         public void onReceivedError(WebView view, int errorCode, String description,
                 String failingUrl) {
-            if (!pageActive || requestId < 0 || isBlankPage(failingUrl)) {
+            if (this != sourceClient || view != webView || !pageActive || requestId < 0 || isBlankPage(failingUrl)) {
                 return;
+            }
+            if (errorCode == WebViewClient.ERROR_FAILED_SSL_HANDSHAKE
+                    && retryHttpsWithLegacyClient(view, failingUrl)) return;
+            synchronized (this) {
+                if (normalizedDocument(failingUrl).equals(attemptedFallback)
+                        && fallbackRetryActive && !fallbackExhausted) {
+                    // cancel() from the original WebView request may report after
+                    // the compatibility retry was scheduled. Do not fail the
+                    // channel while that one fallback request is still active.
+                    return;
+                }
+                fallbackRetryActive = false;
             }
             Log.w(TAG, "Web source failed code=" + errorCode + " url=" + failingUrl
                     + " description=" + description);
+            pageLoadTerminalGeneration = pageLoadGeneration;
             setLoadingVisible(false);
             if (listener != null) {
                 listener.onPageError(requestId,
@@ -795,10 +2442,13 @@ public final class WebSourceView extends FrameLayout {
 
         @Override
         public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
-            if (pageActive && requestId >= 0 && !isBlankPage(url)) {
+            if (this == sourceClient && view == webView && pageActive && requestId >= 0 && !isBlankPage(url)) {
                 // Keep the current address in sync for redirects and single-page sites
                 // that move from one route to another without reopening the channel.
+                if (!url.equals(pageUrl)) resetResourcePage(url);
                 pageUrl = url;
+                tabBar.updateActive(url, view.getTitle());
+                controllerPageTitle = safe(view.getTitle());
                 scheduleDesktopViewport(0L);
                 scheduleDesktopViewport(300L);
             }
@@ -808,6 +2458,9 @@ public final class WebSourceView extends FrameLayout {
 
     private void injectJavascriptCompatibility(WebView view) {
         compatibilityInjectionCount++;
+        WebFullscreenCompatibility.apply(view);
+        WebAudioCompatibility.apply(view);
+        if (!isPageVisible()) setMultimediaPaused(true);
         String script = javascriptCompatibilityScript();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
             view.evaluateJavascript(script, null);
@@ -834,75 +2487,6 @@ public final class WebSourceView extends FrameLayout {
                 + "})(window);";
     }
 
-    private WebResourceResponse interceptCompatibilityBundle(String resourceUrl) {
-        if (!isMaimemoCompatibilityBundle(resourceUrl)) {
-            return null;
-        }
-        try {
-            byte[] patched = compatibilityBundle;
-            if (patched == null || !resourceUrl.equals(compatibilityBundleUrl)) {
-                patched = downloadAndPatchJavascript(resourceUrl);
-                compatibilityBundleUrl = resourceUrl;
-                compatibilityBundle = patched;
-            }
-            return new WebResourceResponse("application/javascript", "UTF-8",
-                    new ByteArrayInputStream(patched));
-        } catch (Exception error) {
-            Log.w(TAG, "Unable to patch old-WebView compatibility bundle " + resourceUrl,
-                    error);
-            return null;
-        }
-    }
-
-    private byte[] downloadAndPatchJavascript(String resourceUrl) throws Exception {
-        HttpURLConnection connection = NetworkClient.open(new URL(resourceUrl));
-        connection.setConnectTimeout(12000);
-        connection.setReadTimeout(20000);
-        connection.setInstanceFollowRedirects(true);
-        connection.setRequestProperty("User-Agent", activeUserAgent);
-        connection.setRequestProperty("Accept", "application/javascript,*/*;q=0.8");
-        String referer = pageUrl;
-        if (referer != null && referer.length() > 0) {
-            connection.setRequestProperty("Referer", referer);
-        }
-        String cookies = CookieManager.getInstance().getCookie(resourceUrl);
-        if (cookies != null && cookies.length() > 0) {
-            connection.setRequestProperty("Cookie", cookies);
-        }
-        try {
-            int responseCode = connection.getResponseCode();
-            if (responseCode < 200 || responseCode >= 300) {
-                throw new java.io.IOException("HTTP " + responseCode);
-            }
-            ByteArrayOutputStream output = new ByteArrayOutputStream(
-                    Math.max(32768, connection.getContentLength() + 2048));
-            output.write(javascriptCompatibilityScript().getBytes("UTF-8"));
-            output.write('\n');
-            InputStream input = connection.getInputStream();
-            try {
-                byte[] buffer = new byte[16384];
-                int count;
-                while ((count = input.read(buffer)) != -1) {
-                    output.write(buffer, 0, count);
-                }
-            } finally {
-                input.close();
-            }
-            return output.toByteArray();
-        } finally {
-            connection.disconnect();
-        }
-    }
-
-    private static boolean isMaimemoCompatibilityBundle(String url) {
-        if (url == null) {
-            return false;
-        }
-        String lower = url.toLowerCase(Locale.US);
-        return lower.startsWith("https://tc-apis.maimemo.com/webstudy/app/js/vendors.")
-                && lower.indexOf(".js") >= 0;
-    }
-
     private static boolean isJavascriptResource(String url) {
         if (url == null) {
             return false;
@@ -925,5 +2509,29 @@ public final class WebSourceView extends FrameLayout {
         }
         String lower = url.toLowerCase(Locale.US);
         return lower.startsWith("http://") || lower.startsWith("https://");
+    }
+
+    static boolean isUserScriptInstallUrl(String value) {
+        if (value == null) return false;
+        try {
+            Uri uri = Uri.parse(value.trim());
+            String scheme = uri.getScheme();
+            String path = uri.getPath();
+            boolean web = "http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme);
+            if (web && path != null && path.toLowerCase(Locale.US).endsWith(".user.js")) {
+                return true;
+            }
+            // Greasy Fork mirrors wrap the actual install URL in this redirect's
+            // fragment. Recognize only that known wrapper, not arbitrary fragments.
+            return web && "home.greasyfork.org.cn".equalsIgnoreCase(uri.getHost())
+                    && "/l".equals(path) && uri.getFragment() != null
+                    && isUserScriptInstallUrl(uri.getFragment());
+        } catch (RuntimeException invalidUrl) {
+            return false;
+        }
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
     }
 }

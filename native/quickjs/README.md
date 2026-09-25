@@ -19,8 +19,11 @@ DOM APIs are not supplied. JNI converts strings through UTF-8 byte arrays, inclu
 and supplementary Unicode characters.
 
 `libntvquickjs.so` is a generic interpreter bundled in the APK, independent of downloaded
-site decryption libraries. CCTV/Gxtv `main(item)` execution uses it; Yangshipin's browser
-authorization flow and the separate Ku9 resolver retain their existing implementations.
+site decryption libraries. CCTV/Gxtv `main(item)` execution uses it. Standalone Ku9
+scripts use QuickJS on API 14–20 and WebView on API 21+. Both Ku9 paths retain CommonJS
+entry points, the bundled crypto/RSA modules, URI/query helpers, hashes, Base64 and
+date conversion. The native host exposes these helpers without emulating a browser DOM.
+Yangshipin's browser authorization flow remains unchanged.
 
 Build with Android NDK r14b:
 

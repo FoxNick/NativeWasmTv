@@ -1,0 +1,22 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body { margin:0; font:24px sans-serif; background:#345; color:white; }
+#search { margin:10px; font:24px sans-serif; }
+#player { position:relative; height:450px; background:#123; }
+#player:fullscreen { width:100vw; height:100vh; }
+#full { display:inline-block; margin:20px; padding:20px; background:#567; }
+#controls { position:absolute; bottom:0; left:0; width:100%; padding:20px 0; opacity:0; background:#456; }
+#controls:hover { opacity:1; }
+#seek { width:80%; margin:0 10%; }
+</style>
+<!-- First tabbable element reproduces Chromium's unsolicited fullscreen focus. -->
+<input id="search" placeholder="Normal input">
+<div id="player">
+  <div id="full" onclick="document.getElementById('player').requestFullscreen()">Full screen</div>
+  <div id="controls"><input id="seek" type="range" min="0" max="100" value="10"></div>
+</div>
+<script>
+var mouseMoves=0;
+document.addEventListener('mousemove',function(e){if(e.isTrusted && e.buttons===0)mouseMoves++;});
+</script>

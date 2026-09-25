@@ -1,18 +1,9 @@
 package xiao.bu.tv;
 
-import android.annotation.SuppressLint;
 import android.app.Activity;
-import android.content.SharedPreferences;
-import android.graphics.Color;
-import android.os.Build;
 import android.text.TextUtils;
 import android.util.Log;
-import android.view.Gravity;
-import android.view.ViewGroup;
 import android.webkit.JavascriptInterface;
-import android.webkit.WebSettings;
-import android.webkit.WebView;
-import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 
 import org.json.JSONException;
@@ -23,13 +14,12 @@ import java.net.InetAddress;
 import java.net.Inet6Address;
 import java.net.NetworkInterface;
 import java.net.SocketException;
-import java.security.MessageDigest;
 import java.util.Enumeration;
 import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** Runs Ku9 scripts in QuickJS on legacy Android, or an isolated WebView on API 21+. */
+/** Resolves Ku9 sources using the shared contract and capability-selected engine. */
 final class Ku9ScriptResolver {
     interface Callback {
         void onResolved(int requestId, Result result);
@@ -40,54 +30,34 @@ final class Ku9ScriptResolver {
     static final class Result {
         final String url;
         final boolean directDataSource;
+        final String referer, cookies;
+        final String userAgent;
+        final String webViewUrl, pageScript;
 
-        Result(String url, boolean directDataSource) {
+        Result(String url, boolean directDataSource, JSONObject fields) {
+            this.webViewUrl = fields.optString("webview", "").trim();
+            this.pageScript = fields.optString("jscode", "");
             this.url = url;
             this.directDataSource = directDataSource;
+            this.referer = Ku9JsContract.resultHeader(fields, "referer", "Referer");
+            this.userAgent = Ku9JsContract.resultHeader(fields, "userAgent", "User-Agent");
+            this.cookies = Ku9JsContract.resultHeader(fields, "cookies", "Cookie");
         }
     }
 
     private static final String TAG = "Ku9ScriptResolver";
-    private final boolean nativeExecution = Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP;
     private final android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());
-    private static final int MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
-    private static final long TIMEOUT_MS = 30000L;
     private static final long MIN_PLAYLIST_REFRESH_MS = 2000L;
     private static final long MAX_PLAYLIST_REFRESH_MS = 5000L;
-    private static final String EXECUTOR_URL = "https://ntv.local/ku9/";
-    private static final Pattern TARGET_DURATION =
-            Pattern.compile("(?m)^#EXT-X-TARGETDURATION:(\\d+)");
-    private static final String EXECUTOR_PAGE =
-            "<!doctype html><html><head><meta charset=\"utf-8\"></head>"
-                    + "<body></body></html>";
-    private static final String ES5_COMPAT =
-            "if(!String.prototype.startsWith){String.prototype.startsWith=function(s,p){"
-                    + "p=p||0;return this.substr(p,s.length)===s;};}"
-                    + "if(!String.prototype.endsWith){String.prototype.endsWith=function(s,p){"
-                    + "var t=String(this);if(p===undefined||p>t.length)p=t.length;"
-                    + "return t.substring(p-s.length,p)===s;};}"
-                    + "if(!String.prototype.includes){String.prototype.includes=function(s,p){"
-                    + "return this.indexOf(s,p||0)!==-1;};}"
-                    + "if(!Array.prototype.includes){Array.prototype.includes=function(v,p){"
-                    + "return this.indexOf(v,p||0)!==-1;};}";
-
+    private static final Pattern TARGET_DURATION = Pattern.compile("(?m)^#EXT-X-TARGETDURATION:(\\d+)");
     private final Activity activity;
-    private final FrameLayout root;
-    private final SharedPreferences cache;
+    private final Ku9SiteCache cache;
+    private final Ku9JsContract contract;
+    private final Ku9ScriptEngine engine;
     private final Ku9ScriptLoader scriptLoader;
-    private WebView webView;
     private volatile Pending pending;
     private Ku9PlaylistServer playlistServer;
     private volatile int generation;
-    private final Runnable timeout = new Runnable() {
-        @Override
-        public void run() {
-            Pending request = pending;
-            if (request != null) {
-                fail(request, "酷9脚本解析超时");
-            }
-        }
-    };
     private final Runnable refreshPlaylist = new Runnable() {
         @Override
         public void run() {
@@ -101,8 +71,9 @@ final class Ku9ScriptResolver {
 
     Ku9ScriptResolver(Activity activity, FrameLayout root) {
         this.activity = activity;
-        this.root = root;
-        cache = activity.getSharedPreferences("ku9_script_cache", Activity.MODE_PRIVATE);
+        cache = Ku9SiteCache.legacy(activity);
+        contract = new Ku9JsContract(activity);
+        engine = new Ku9ScriptEngine(activity);
         scriptLoader = new Ku9ScriptLoader(activity);
     }
 
@@ -118,15 +89,18 @@ final class Ku9ScriptResolver {
             @Override
             public void run() {
                 try {
-                    final String script = scriptLoader.load(sourceUrl, !nativeExecution);
+                    final String script = scriptLoader.load(sourceUrl, false);
+                    final Pending work = new Pending(requestId, requestGeneration,
+                            channelName, sourceUrl, script, callback);
+                    work.javascript = buildJavascript(work);
                     activity.runOnUiThread(new Runnable() {
                         @Override
                         public void run() {
                             if (requestGeneration != generation || activity.isFinishing()) {
                                 return;
                             }
-                            startExecution(new Pending(requestId, requestGeneration,
-                                    channelName, sourceUrl, script, callback));
+                            pending = work;
+                            execute(work);
                         }
                     });
                 } catch (final IOException error) {
@@ -144,95 +118,9 @@ final class Ku9ScriptResolver {
         }, "ku9-script-load").start();
     }
 
-    @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
-    private void ensureWebView(Pending request) throws IOException {
-        if (webView != null) {
-            return;
-        }
-        try {
-            webView = new WebView(activity);
-        } catch (RuntimeException error) {
-            throw new IOException("系统 WebView 不可用", error);
-        }
-        WebSettings settings = webView.getSettings();
-        settings.setJavaScriptEnabled(true);
-        settings.setDomStorageEnabled(false);
-        settings.setDatabaseEnabled(false);
-        settings.setAllowFileAccess(false);
-        settings.setAllowContentAccess(false);
-        settings.setMediaPlaybackRequiresUserGesture(true);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
-        }
-        webView.setBackgroundColor(Color.TRANSPARENT);
-        webView.setAlpha(0f);
-        webView.setTranslationX(-10000f);
-        webView.setTranslationY(-10000f);
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(1, 1);
-        params.gravity = Gravity.LEFT | Gravity.TOP;
-        root.addView(webView, params);
-        webView.addJavascriptInterface(new Bridge(request), "NtvKu9Bridge");
-        webView.setWebViewClient(new WebViewClient() {
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                Pending request = pending;
-                if (request != null && EXECUTOR_URL.equals(url)) {
-                    execute(request);
-                }
-            }
-
-            @Override
-            public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                return !EXECUTOR_URL.equals(url);
-            }
-        });
-    }
-
-    private void startExecution(Pending request) {
-        if (nativeExecution) {
-            pending = request;
-            execute(request);
-            return;
-        }
-        try {
-            ensureWebView(request);
-        } catch (IOException error) {
-            request.callback.onFailed(request.requestId, error.getMessage());
-            return;
-        }
-        pending = request;
-        webView.removeCallbacks(timeout);
-        webView.postDelayed(timeout, TIMEOUT_MS);
-        webView.loadDataWithBaseURL(EXECUTOR_URL, EXECUTOR_PAGE,
-                "text/html", "UTF-8", null);
-    }
-
     private void execute(Pending request) {
-        if (pending != request || request.generation != generation) {
-            return;
-        }
-        if (nativeExecution) {
-            final Pending work = request;
-            handler.removeCallbacks(timeout);
-            handler.postDelayed(timeout, TIMEOUT_MS);
-            new Thread(new Runnable() {
-                @Override public void run() {
-                    Bridge host = new Bridge(work);
-                    long started = android.os.SystemClock.elapsedRealtime();
-                    try {
-                        NativeQuickJs.execute(buildJavascript(work), host);
-                        if (!host.terminal && !host.isCancelled()) host.fail("脚本没有返回播放结果");
-                    } catch (Throwable error) {
-                        if (!host.isCancelled()) host.fail("QuickJS: " + safeMessage(error));
-                    } finally {
-                        Log.i(TAG, "QuickJS channel=" + work.channelName + " elapsedMs="
-                                + (android.os.SystemClock.elapsedRealtime() - started));
-                    }
-                }
-            }, "ku9-quickjs").start();
-        } else {
-            webView.evaluateJavascript(buildJavascript(request), null);
-        }
+        if (pending != request || request.generation != generation) return;
+        engine.execute(request.javascript, new Bridge(request), request.browser);
     }
 
     private String buildJavascript(Pending request) {
@@ -242,36 +130,32 @@ final class Ku9ScriptResolver {
             item.put("name", request.channelName == null ? "" : request.channelName);
         } catch (JSONException ignored) {
         }
-        if (nativeExecution) return CjsSiteResolver.buildJavascript(request.script, item);
-        return "(function(){'use strict';"
-                + Ku9JsContract.bootstrap("NtvKu9Bridge")
-                + ES5_COMPAT
-                + "function done(v){try{if(v===undefined||v===null)v={};"
-                + "NtvKu9Bridge.complete(JSON.stringify(v));}catch(e){fail(e);}}"
-                + "function fail(e){NtvKu9Bridge.fail(String(e&&e.stack?e.stack:e));}"
-                + "try{" + request.script + "\n"
-                + "if(typeof main!=='function')throw new Error('脚本没有 main(item) 入口');"
-                + "var r=main(" + item.toString() + ");"
-                + "if(r&&typeof r.then==='function'){r.then(done,fail);}else{done(r);}}"
-                + "catch(e){fail(e);}})();";
+        return contract.build(request.script, item);
     }
 
     private void complete(Pending request, String json) {
         try {
             Ku9JsContract.Output output = Ku9JsContract.parse(json);
+            if (output.webViewUrl.length() > 0) {
+                if (!output.webViewUrl.startsWith("https://") && !output.webViewUrl.startsWith("http://"))
+                    throw new IOException("酷9网页地址必须使用 HTTP 或 HTTPS");
+                clearPending();
+                request.callback.onResolved(request.requestId, new Result("", false, output.fields));
+                return;
+            }
             String url = output.url;
             String m3u8 = output.playlist;
             if (!TextUtils.isEmpty(m3u8) && m3u8.trim().startsWith("#EXTM3U")) {
-                if (!nativeExecution && containsIpv6Literal(m3u8) && !hasUsableIpv6Network()) {
+                if (containsIpv6Literal(m3u8) && !hasUsableIpv6Network()) {
                     throw new IOException("当前网络没有 IPv6，无法播放此频道");
                 }
-                completeLivePlaylist(request, m3u8.trim() + "\n");
+                completeLivePlaylist(request, m3u8.trim() + "\n", output.fields);
                 return;
             } else if (!TextUtils.isEmpty(url)) {
-                if (!nativeExecution && containsIpv6Literal(url) && !hasUsableIpv6Network()) {
+                if (containsIpv6Literal(url) && !hasUsableIpv6Network()) {
                     throw new IOException("当前网络没有 IPv6，无法播放此频道");
                 }
-                Result result = new Result(url.trim(), Ku9JsContract.isDirectDataSource(url));
+                Result result = new Result(url.trim(), Ku9JsContract.isDirectDataSource(url), output.fields);
                 clearPending();
                 request.callback.onResolved(request.requestId, result);
                 return;
@@ -283,27 +167,19 @@ final class Ku9ScriptResolver {
         }
     }
 
-    private void completeLivePlaylist(Pending request, String content) throws IOException {
+    private void completeLivePlaylist(Pending request, String content, JSONObject fields) throws IOException {
         if (playlistServer == null) {
             playlistServer = new Ku9PlaylistServer();
             playlistServer.start();
         }
         playlistServer.update(content);
-        if (nativeExecution) {
-            handler.removeCallbacks(timeout);
-            handler.removeCallbacks(refreshPlaylist);
-            if (!content.contains("#EXT-X-ENDLIST"))
-                handler.postDelayed(refreshPlaylist, playlistRefreshDelay(content));
-        }
-        if (webView != null) {
-            webView.removeCallbacks(timeout);
-            webView.removeCallbacks(refreshPlaylist);
-            webView.postDelayed(refreshPlaylist, playlistRefreshDelay(content));
-        }
+        handler.removeCallbacks(refreshPlaylist);
+        if (!content.contains("#EXT-X-ENDLIST"))
+            handler.postDelayed(refreshPlaylist, playlistRefreshDelay(content));
         if (!request.initialCompleted) {
             request.initialCompleted = true;
             request.callback.onResolved(request.requestId,
-                    new Result(playlistServer.url(), false));
+                    new Result(playlistServer.url(), false, fields));
         }
     }
 
@@ -358,15 +234,8 @@ final class Ku9ScriptResolver {
         }
         if (request.initialCompleted) {
             Log.w(TAG, reason + "; retaining the last live playlist");
-            if (nativeExecution) {
-                handler.removeCallbacks(timeout);
-                handler.removeCallbacks(refreshPlaylist);
-                handler.postDelayed(refreshPlaylist, MAX_PLAYLIST_REFRESH_MS);
-            }
-            if (webView != null) {
-                webView.removeCallbacks(refreshPlaylist);
-                webView.postDelayed(refreshPlaylist, MAX_PLAYLIST_REFRESH_MS);
-            }
+            handler.removeCallbacks(refreshPlaylist);
+            handler.postDelayed(refreshPlaylist, MAX_PLAYLIST_REFRESH_MS);
             return;
         }
         clearPending();
@@ -375,38 +244,18 @@ final class Ku9ScriptResolver {
     }
 
     private void clearPending() {
-        handler.removeCallbacks(timeout);
         handler.removeCallbacks(refreshPlaylist);
-        if (webView != null) {
-            webView.removeCallbacks(timeout);
-            webView.removeCallbacks(refreshPlaylist);
-        }
         pending = null;
+        engine.cancel();
     }
 
     void cancel() {
         generation++;
         clearPending();
         closePlaylistServer();
-        destroyWebView();
     }
 
-    void destroy() {
-        cancel();
-    }
-
-    private void destroyWebView() {
-        if (webView != null) {
-            webView.stopLoading();
-            webView.removeJavascriptInterface("NtvKu9Bridge");
-            ViewGroup parent = (ViewGroup) webView.getParent();
-            if (parent != null) {
-                parent.removeView(webView);
-            }
-            webView.destroy();
-            webView = null;
-        }
-    }
+    void destroy() { cancel(); }
 
     private void closePlaylistServer() {
         if (playlistServer != null) {
@@ -415,127 +264,26 @@ final class Ku9ScriptResolver {
         }
     }
 
-    private final class Bridge implements NativeQuickJs.Host {
+    private final class Bridge extends Ku9Host {
         private final Pending request;
-        private boolean terminal;
-
-        @Override public boolean isCancelled() {
+        Bridge(Pending request) { this.request = request; }
+        @Override protected boolean isRequestCancelled() {
             return request.generation != generation || pending != request || Thread.currentThread().isInterrupted();
         }
-
-        @Override public String invoke(int operation, String[] args) throws Exception {
-            if (isCancelled()) throw new IOException("Ku9 request cancelled");
-            switch (operation) {
-                case 0: return get(args[0], args[1]);
-                case 1: return post(args[0], args[1], args[2]);
-                case 2: return request(args[0], args[1], args[2], args[3], Boolean.parseBoolean(args[4]));
-                case 3: return md5(args[0]);
-                case 4: log(args[0]); return null;
-                case 5: complete(args[0]); return null;
-                case 6: fail(args[0]); return null;
-                case 7: return getCache(args[0]);
-                case 8: setCache(args[0], args[1], Double.parseDouble(args[2])); return null;
-                default: throw new IOException("Unknown Ku9 host operation");
-            }
+        @Override @JavascriptInterface public String getCache(String key) { return cache.get(key); }
+        @Override @JavascriptInterface public void setCache(String key, String value, double ttlMs) {
+            cache.put(key, value, ttlMs);
         }
-
-        Bridge(Pending request) {
-            this.request = request;
-        }
-
-        @JavascriptInterface
-        public String get(String url, String headersJson) {
-            try {
-                return Ku9HttpClient.getText(url, Ku9HttpClient.parseHeaders(headersJson),
-                        MAX_RESPONSE_BYTES);
-            } catch (IOException error) {
-                Log.w(TAG, "Ku9 GET failed: " + url, error);
-                return "";
-            }
-        }
-
-        @JavascriptInterface
-        public String post(String url, String body, String headersJson) {
-            return Ku9HttpClient.postText(url, body, headersJson, MAX_RESPONSE_BYTES);
-        }
-
-        @JavascriptInterface
-        public String request(String url, String method, String headersJson, String body,
-                boolean followRedirects) {
-            return Ku9HttpClient.requestJson(url, method, headersJson, body,
-                    followRedirects, MAX_RESPONSE_BYTES);
-        }
-
-        @JavascriptInterface
-        public String getCache(String key) {
-            long expiresAt = cache.getLong(key + "__expires", 0L);
-            if (expiresAt > 0L && expiresAt < System.currentTimeMillis()) {
-                cache.edit().remove(key).remove(key + "__expires").apply();
-                return "";
-            }
-            return cache.getString(key, "");
-        }
-
-        @JavascriptInterface
-        public void setCache(String key, String value, double ttlMs) {
-            long expiresAt = ttlMs <= 0 ? 0L
-                    : System.currentTimeMillis() + Math.max(0L, (long) ttlMs);
-            cache.edit().putString(key, value == null ? "" : value)
-                    .putLong(key + "__expires", expiresAt).apply();
-        }
-
-        @JavascriptInterface
-        public String md5(String value) {
-            try {
-                MessageDigest digest = MessageDigest.getInstance("MD5");
-                byte[] bytes = digest.digest(value.getBytes("UTF-8"));
-                StringBuilder result = new StringBuilder(bytes.length * 2);
-                for (byte item : bytes) {
-                    result.append(String.format(Locale.US, "%02x", item & 0xff));
-                }
-                return result.toString();
-            } catch (Exception error) {
-                return "";
-            }
-        }
-
-        @JavascriptInterface
-        public void log(String value) {
-            Log.d(TAG, value);
-        }
-
-        @JavascriptInterface
-        public void complete(final String resultJson) {
-            if (nativeExecution && terminal) return;
-            if (nativeExecution) terminal = true;
-            if (pending != request) {
-                return;
-            }
-            activity.runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    if (pending == request && request.generation == generation) {
-                        Ku9ScriptResolver.this.complete(request, resultJson);
-                    }
-                }
+        @Override protected void onComplete(final String json) {
+            activity.runOnUiThread(() -> {
+                if (pending == request && request.generation == generation)
+                    Ku9ScriptResolver.this.complete(request, json);
             });
         }
-
-        @JavascriptInterface
-        public void fail(final String reason) {
-            if (nativeExecution && terminal) return;
-            if (nativeExecution) terminal = true;
-            if (pending != request) {
-                return;
-            }
-            activity.runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    if (pending == request && request.generation == generation) {
-                        Ku9ScriptResolver.this.fail(request,
-                                "酷9脚本执行失败: " + reason);
-                    }
-                }
+        @Override protected void onFailure(final String reason) {
+            activity.runOnUiThread(() -> {
+                if (pending == request && request.generation == generation)
+                    Ku9ScriptResolver.this.fail(request, "酷9脚本执行失败: " + reason);
             });
         }
     }
@@ -561,6 +309,8 @@ final class Ku9ScriptResolver {
         final String script;
         final Callback callback;
         boolean initialCompleted;
+        final boolean browser;
+        String javascript;
 
         Pending(int requestId, int generation, String channelName, String sourceUrl,
                 String script, Callback callback) {
@@ -569,6 +319,7 @@ final class Ku9ScriptResolver {
             this.channelName = channelName;
             this.sourceUrl = sourceUrl;
             this.script = script;
+            this.browser = Ku9EnginePolicy.usesWebView(script);
             this.callback = callback;
         }
     }

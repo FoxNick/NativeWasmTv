@@ -65,6 +65,8 @@ CCTV/Gxtv CJS `main(item)` now runs in a bundled QuickJS interpreter on a worker
 without creating an offscreen WebView. JSON arguments/results and cjs HTTP/MD5 helpers
 keep the existing plugin contract. The independent site SO files do not change.
 Each runtime has memory/stack limits and cancellation/deadline handling; it is released
-after execution. Yangshipin's browser authorization and the separate Ku9 resolver remain
-on their existing paths. See [API 15 test report](compatibility-android-4.0.md) and
+after execution. Standalone Ku9 scripts also use QuickJS on API 14–20, including the
+private application's CommonJS, crypto/RSA, URI/query and date helpers. API 21+ Ku9
+scripts and Yangshipin authorization retain their WebView paths.
+See [API 15 test report](compatibility-android-4.0.md) and
 [engine/build documentation](../native/quickjs/README.md).

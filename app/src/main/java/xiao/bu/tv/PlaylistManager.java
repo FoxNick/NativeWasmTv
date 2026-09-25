@@ -43,11 +43,11 @@ final class PlaylistManager {
     private static final String EMBEDDED_EPG_URL = "embedded_epg_url";
     private static final String LEGACY_CACHE_FILE = "online-playlist.txt";
     private static final String CACHE_PREFIX = "online-playlist-";
+    private static final String CACHE_METADATA_PREFIX = "playlist_cache_metadata_";
+    private static final String MOBILE_CACHE_INDEX = "mobile_playlist_cache_index_v1";
     private static final String MOBILE_MERGED_FILE = "mobile-merged-playlist.m3u";
     private static final String IMPORT_DIRECTORY = "imported-playlists";
     private static final String BUILT_IN_PLAYLIST = "builtin_channels.txt";
-    private static final String RECOMMENDED_LIVE_TV_RAW_URL =
-            "https://raw.githubusercontent.com/vbskycn/iptv/refs/heads/master/tv/iptv4.txt";
     private static final int MAX_SOURCES = 20;
     private static final int PLAYLIST_READ_TIMEOUT_MS = 60000;
     private static final int MIN_PLAYLIST_BYTES = 8 * 1024 * 1024;
@@ -73,33 +73,32 @@ final class PlaylistManager {
         catalogStore = new ChannelCatalogStore(this.context);
     }
 
-    static String getRecommendedUrl() {
+    String getRecommendedUrl() {
         return getRecommendedWebViewUrl();
     }
 
-    static JSONArray getRecommendedSourcesJson() throws JSONException {
+    JSONArray getRecommendedSourcesJson() throws JSONException {
         return new JSONArray()
                 .put(new JSONObject()
                         .put("name", "网址导航")
                         .put("url", getRecommendedJoyUrl()))
                 .put(new JSONObject()
-                        .put("name", "网页电视台")
-                        .put("url", getRecommendedWebViewUrl()))
+                        .put("name", "电台资源")
+                        .put("url", BuildConfig.RECOMMENDED_FM_SOURCE_URL))
                 .put(new JSONObject()
-                        .put("name", "直播电视网资源")
-                        .put("url", getRecommendedLiveTvUrl()));
+                        .put("name", "网页测试")
+                        .put("url", BuildConfig.RECOMMENDED_TEST_SOURCE_URL))
+                .put(new JSONObject()
+                        .put("name", "网页电视台")
+                        .put("url", getRecommendedWebViewUrl()));
     }
 
-    private static String getRecommendedJoyUrl() {
-        return GithubProxy.apply(BuildConfig.RECOMMENDED_JOY_SOURCE_URL);
+    private String getRecommendedJoyUrl() {
+        return BuildConfig.RECOMMENDED_JOY_SOURCE_URL;
     }
 
-    private static String getRecommendedWebViewUrl() {
-        return GithubProxy.apply(BuildConfig.RECOMMENDED_WEBVIEW_SOURCE_URL);
-    }
-
-    private static String getRecommendedLiveTvUrl() {
-        return GithubProxy.apply(RECOMMENDED_LIVE_TV_RAW_URL);
+    private String getRecommendedWebViewUrl() {
+        return BuildConfig.RECOMMENDED_WEBVIEW_SOURCE_URL;
     }
 
     String getPlaylistUrl() {
@@ -288,7 +287,7 @@ final class PlaylistManager {
                 if (bytes == null) {
                     continue;
                 }
-                loaded.add(parse(bytes));
+                loaded.add(parse(bytes, source.location));
                 if (embeddedEpg.length() == 0) {
                     embeddedEpg = discoverEpgUrl(bytes);
                 }
@@ -362,9 +361,13 @@ final class PlaylistManager {
             enabledCount++;
             byte[] bytes = null;
             try {
-                bytes = readSource(source);
-                if (!isLocalLocation(source.location)) {
+                SourceRead read = readSource(source);
+                bytes = read.bytes;
+                if (!isLocalLocation(source.location) && read.cacheChanged) {
                     writeCache(source, bytes);
+                }
+                if (!isLocalLocation(source.location) && read.metadata != null) {
+                    saveCacheMetadata(source, read.metadata);
                 }
             } catch (IOException error) {
                 if (!isLocalLocation(source.location)) {
@@ -400,7 +403,7 @@ final class PlaylistManager {
         int externalChannelCount = 0;
         for (LoadedSource source : fetched) {
             if (source.bytes != null) {
-                ChannelCatalog.Group[] parsed = parse(source.bytes);
+                ChannelCatalog.Group[] parsed = parse(source.bytes, source.source.location);
                 for (ChannelCatalog.Group group : parsed) {
                     externalChannelCount += group.channels.length;
                 }
@@ -458,7 +461,22 @@ final class PlaylistManager {
         if (value.length() == 0 || !isSupportedLocation(value)) {
             throw new IOException("频道源地址无效");
         }
-        return isLocalLocation(value) ? readLocal(value) : download(value);
+        if (isLocalLocation(value)) return readLocal(value);
+        Source source = null;
+        for (Source configured : getSources()) {
+            if (value.equals(configured.location)) {
+                source = configured;
+                break;
+            }
+        }
+        if (source == null) {
+            source = new Source(mobileCacheId(value), "手机频道源", value, true);
+        }
+        SourceRead read = readSource(source);
+        if (read.cacheChanged) writeCache(source, read.bytes);
+        if (read.metadata != null) saveCacheMetadata(source, read.metadata);
+        rememberMobileCache(source);
+        return read.bytes;
     }
 
     private synchronized ChannelCatalog.Group[] rememberAndFilterGroups(
@@ -640,6 +658,7 @@ final class PlaylistManager {
         for (Source source : previous) {
             if (!retained.contains(source.id)) {
                 context.deleteFile(cacheFile(source));
+                preferences.edit().remove(cacheMetadataKey(source)).apply();
                 if ("legacy".equals(source.id)) {
                     context.deleteFile(LEGACY_CACHE_FILE);
                 }
@@ -654,9 +673,20 @@ final class PlaylistManager {
         return readCache(source);
     }
 
-    private byte[] readSource(Source source) throws IOException {
-        return isLocalLocation(source.location) ? readLocal(source.location)
-                : download(source.location);
+    private SourceRead readSource(Source source) throws IOException {
+        if (isLocalLocation(source.location)) {
+            return new SourceRead(readLocal(source.location), false, null);
+        }
+        File cache = context.getFileStreamPath(cacheFile(source));
+        RemoteFileMetadata previous = readCacheMetadata(source);
+        RemoteDownload downloaded = download(source.location, null, null, 0,
+                previous, cache);
+        if (downloaded.notModified) {
+            return new SourceRead(readCache(source), false, previous);
+        }
+        boolean unchanged = previous != null && previous.sameContent(downloaded.metadata)
+                && previous.matchesLocal(cache);
+        return new SourceRead(downloaded.bytes, !unchanged, downloaded.metadata);
     }
 
     private byte[] readLocal(String location) throws IOException {
@@ -703,39 +733,59 @@ final class PlaylistManager {
         return location.startsWith("/") ? location : null;
     }
 
-    private byte[] download(String sourceUrl) throws IOException {
-        return download(sourceUrl, null, null, 0);
-    }
-
-    private byte[] download(String sourceUrl, String cookie, String referer,
-            int challengeCount) throws IOException {
-        URL url = new URL(sourceUrl);
+    private RemoteDownload download(String sourceUrl, String cookie, String referer,
+            int challengeCount, RemoteFileMetadata previous, File cachedFile)
+            throws IOException {
+        String requestUrl = GithubProxy.apply(context, sourceUrl);
+        URL url = new URL(requestUrl);
+        boolean reusableCache = previous != null && previous.matchesLocal(cachedFile);
+        if (previous != null && previous.appliesTo(sourceUrl)
+                && reusableCache && previous.shouldProbeMd5()
+                && playlistHeadMatches(url, sourceUrl, cookie, referer,
+                        previous, cachedFile)) {
+            Log.i(TAG, "Channel source unchanged by size/MD5 " + sourceUrl);
+            return RemoteDownload.notModified();
+        }
         HttpURLConnection connection = NetworkClient.open(url);
         connection.setConnectTimeout(12000);
         connection.setReadTimeout(PLAYLIST_READ_TIMEOUT_MS);
         connection.setInstanceFollowRedirects(true);
         connection.setRequestProperty("User-Agent", "nTv/1.5");
+        connection.setRequestProperty("Accept-Encoding", "identity");
         if (cookie != null) {
             connection.setRequestProperty("Cookie", cookie);
         }
         if (referer != null) {
             connection.setRequestProperty("Referer", referer);
         }
+        if (reusableCache) {
+            previous.applyConditionalHeaders(connection, sourceUrl);
+        }
         try {
             int status = connection.getResponseCode();
+            if (status == HttpURLConnection.HTTP_NOT_MODIFIED
+                    && reusableCache && previous.appliesTo(sourceUrl)) {
+                return RemoteDownload.notModified();
+            }
             if (status < 200 || status >= 300) {
                 throw new IOException("下载失败：HTTP " + status);
             }
+            RemoteFileMetadata response = RemoteFileMetadata.fromResponse(
+                    connection, sourceUrl);
+            if (response.contentLength > playlistByteLimit()) {
+                throw new IOException("频道文件超过设备可安全处理的大小");
+            }
             byte[] body = readAll(connection.getInputStream());
+            response = response.verify(body, "频道源");
             AesCookieChallenge challenge = parseAesCookieChallenge(body, url);
             if (challenge == null) {
-                return body;
+                return new RemoteDownload(body, response, false);
             }
             if (challengeCount >= 2) {
                 throw new IOException("频道源的网页验证未通过");
             }
             return download(challenge.location, "__test=" + challenge.cookie,
-                    sourceUrl, challengeCount + 1);
+                    sourceUrl, challengeCount + 1, previous, cachedFile);
         } finally {
             connection.disconnect();
         }
@@ -798,6 +848,7 @@ final class PlaylistManager {
         InputStream input = null;
         try {
             String filename = cacheFile(source);
+            RemoteFileMetadata.recover(context.getFileStreamPath(filename));
             try {
                 input = context.openFileInput(filename);
             } catch (IOException error) {
@@ -815,12 +866,70 @@ final class PlaylistManager {
     }
 
     private void writeCache(Source source, byte[] bytes) throws IOException {
-        FileOutputStream output = context.openFileOutput(cacheFile(source), Context.MODE_PRIVATE);
+        File target = context.getFileStreamPath(cacheFile(source));
+        RemoteFileMetadata.writeAtomically(target, bytes, "频道源");
+    }
+
+    private boolean playlistHeadMatches(URL url, String sourceUrl, String cookie,
+            String referer, RemoteFileMetadata previous, File cachedFile) {
+        HttpURLConnection connection = null;
         try {
-            output.write(bytes);
+            connection = NetworkClient.open(url);
+            connection.setRequestMethod("HEAD");
+            connection.setConnectTimeout(12000);
+            connection.setReadTimeout(12000);
+            connection.setInstanceFollowRedirects(true);
+            connection.setRequestProperty("User-Agent", "nTv/1.5");
+            connection.setRequestProperty("Accept-Encoding", "identity");
+            if (cookie != null) connection.setRequestProperty("Cookie", cookie);
+            if (referer != null) connection.setRequestProperty("Referer", referer);
+            int status = connection.getResponseCode();
+            return status >= 200 && status < 300 && previous.matchesRemote(
+                    RemoteFileMetadata.fromResponse(connection, sourceUrl), cachedFile);
+        } catch (IOException ignored) {
+            return false;
         } finally {
-            output.close();
+            if (connection != null) connection.disconnect();
         }
+    }
+
+    private RemoteFileMetadata readCacheMetadata(Source source) {
+        return RemoteFileMetadata.fromJson(preferences.getString(
+                cacheMetadataKey(source), ""));
+    }
+
+    private void saveCacheMetadata(Source source, RemoteFileMetadata metadata) {
+        preferences.edit().putString(cacheMetadataKey(source), metadata.toJson()).apply();
+    }
+
+    private static String cacheMetadataKey(Source source) {
+        return CACHE_METADATA_PREFIX + source.id;
+    }
+
+    private void rememberMobileCache(Source source) {
+        if (!source.id.startsWith("mobile_")) return;
+        List<String> ids = new ArrayList<String>();
+        String saved = preferences.getString(MOBILE_CACHE_INDEX, "");
+        if (saved.length() > 0) {
+            try {
+                JSONArray stored = new JSONArray(saved);
+                for (int index = 0; index < stored.length(); index++) {
+                    String id = sanitizeId(stored.optString(index, ""));
+                    if (id.length() > 0 && !id.equals(source.id)) ids.add(id);
+                }
+            } catch (JSONException ignored) {
+            }
+        }
+        ids.add(source.id);
+        while (ids.size() > MAX_SOURCES) {
+            String expired = ids.remove(0);
+            Source old = new Source(expired, "", "", false);
+            context.deleteFile(cacheFile(old));
+            preferences.edit().remove(cacheMetadataKey(old)).apply();
+        }
+        JSONArray updated = new JSONArray();
+        for (String id : ids) updated.put(id);
+        preferences.edit().putString(MOBILE_CACHE_INDEX, updated.toString()).apply();
     }
 
     private byte[] readMobileMerged() {
@@ -1039,6 +1148,13 @@ final class PlaylistManager {
 
     private static String normalizeGroupTitle(String title) {
         String value = title == null ? "" : title.trim();
+        String[] bookmarkPrefixes = { "Chrome书签 / ", "Chrome 书签 / " };
+        for (String prefix : bookmarkPrefixes) {
+            if (value.startsWith(prefix)) {
+                value = value.substring(prefix.length()).trim();
+                break;
+            }
+        }
         boolean changed = true;
         while (changed && value.startsWith("在线")) {
             changed = false;
@@ -1055,12 +1171,18 @@ final class PlaylistManager {
     }
 
     private static ChannelCatalog.Group[] parse(byte[] bytes) throws IOException {
+        return parse(bytes, "");
+    }
+
+    private static ChannelCatalog.Group[] parse(byte[] bytes, String base) throws IOException {
         String text = decode(bytes);
         Map<String, ChannelBucket> groups = new LinkedHashMap<String, ChannelBucket>();
         String currentGroup = "在线频道";
         String pendingName = null;
         String pendingGroup = null;
         String pendingEpgId = null;
+        String pendingLogo = null;
+        String pendingSubtitles = "";
         int count = 0;
         int lineStart = 0;
         while (lineStart <= text.length()) {
@@ -1084,6 +1206,9 @@ final class PlaylistManager {
                 pendingName = attribute(line, "tvg-name");
                 pendingGroup = attribute(line, "group-title");
                 pendingEpgId = attribute(line, "tvg-id");
+                pendingLogo = attribute(line, "tvg-logo");
+                pendingSubtitles = Channel.resolveSubtitleUrl(attribute(line, "subtitles"), base);
+                if (pendingSubtitles.isEmpty()) pendingSubtitles = Channel.resolveSubtitleUrl(attribute(line, "subtitle"), base);
                 int comma = line.lastIndexOf(',');
                 if (comma >= 0 && comma + 1 < line.length()) {
                     pendingName = line.substring(comma + 1).trim();
@@ -1093,6 +1218,10 @@ final class PlaylistManager {
                 }
                 continue;
             }
+            if (pendingName != null && line.regionMatches(true, 0, "#EXTVLCOPT:sub-file=", 0, 20)) {
+                String subtitle = Channel.resolveSubtitleUrl(line.substring(20), base);
+                if (!subtitle.isEmpty()) pendingSubtitles += (pendingSubtitles.isEmpty() ? "" : "\n") + subtitle;
+            }
             if (line.startsWith("#")) {
                 if (lineEnd == text.length()) {
                     break;
@@ -1101,10 +1230,12 @@ final class PlaylistManager {
             }
             if (pendingName != null && isStreamUrl(line)) {
                 String groupName = emptyToDefault(pendingGroup, currentGroup);
-                add(groups, groupName, pendingName, line, pendingEpgId, count++);
+                add(groups, groupName, pendingName, line, pendingEpgId, pendingLogo, pendingSubtitles, count++);
                 pendingName = null;
                 pendingGroup = null;
                 pendingEpgId = null;
+                pendingLogo = null;
+                pendingSubtitles = "";
             } else {
                 int comma = line.indexOf(',');
                 if (comma <= 0 || comma + 1 >= line.length()) {
@@ -1112,10 +1243,13 @@ final class PlaylistManager {
                 }
                 String name = line.substring(0, comma).trim();
                 String value = line.substring(comma + 1).trim();
-                if ("#genre#".equalsIgnoreCase(value)) {
+                // Accept empty CSV fields produced by PHP/TXT playlist generators.
+                // Preserve every character inside a real URL (including query commas).
+                value = value.replaceFirst("(?i)^(?:,\\s*)+(?=(?:https?|rtmps?|rtmpt|rtsp|webview)://)", "");
+                if (value.matches("(?i)#genre#(?:\\s*,\\s*)*")) {
                     currentGroup = name.length() == 0 ? "在线频道" : name;
                 } else if (isStreamUrl(value)) {
-                    add(groups, currentGroup, name, value, null, count++);
+                    add(groups, currentGroup, name, value, null, null, "", count++);
                 }
             }
             if (lineEnd == text.length()) {
@@ -1148,7 +1282,7 @@ final class PlaylistManager {
     }
 
     private static void add(Map<String, ChannelBucket> groups, String groupName,
-            String name, String url, String epgId, int index) {
+            String name, String url, String epgId, String logoUrl, String subtitles, int index) {
         String safeGroup = normalizeGroupTitle(groupName);
         ChannelBucket bucket = groups.get(safeGroup);
         if (bucket == null) {
@@ -1161,7 +1295,7 @@ final class PlaylistManager {
                 bucket.channels.size() + 1),
                 safeName, "custom_" + index, url, null, null, null,
                 epgId == null || epgId.trim().length() == 0 ? safeName : epgId.trim());
-        bucket.add(incoming);
+        bucket.add(incoming.withLogo(logoUrl).withSubtitles(subtitles));
     }
 
     private static String channelNumber(String name, String epgId, int fallback) {
@@ -1212,6 +1346,9 @@ final class PlaylistManager {
                 return;
             }
             Channel existing = channels.get(existingIndex);
+            if (existing.logoUrl.length() == 0 && incoming.logoUrl.length() > 0)
+                existing = existing.withLogo(incoming.logoUrl);
+            existing = existing.withSubtitles(incoming.subtitleUrlsText());
             for (String url : incoming.urls) {
                 existing = existing.withAdditionalUrl(url);
             }
@@ -1270,6 +1407,34 @@ final class PlaylistManager {
         }
     }
 
+    private static final class SourceRead {
+        final byte[] bytes;
+        final boolean cacheChanged;
+        final RemoteFileMetadata metadata;
+
+        SourceRead(byte[] bytes, boolean cacheChanged, RemoteFileMetadata metadata) {
+            this.bytes = bytes;
+            this.cacheChanged = cacheChanged;
+            this.metadata = metadata;
+        }
+    }
+
+    private static final class RemoteDownload {
+        final byte[] bytes;
+        final RemoteFileMetadata metadata;
+        final boolean notModified;
+
+        RemoteDownload(byte[] bytes, RemoteFileMetadata metadata, boolean notModified) {
+            this.bytes = bytes;
+            this.metadata = metadata;
+            this.notModified = notModified;
+        }
+
+        static RemoteDownload notModified() {
+            return new RemoteDownload(null, null, true);
+        }
+    }
+
     private static boolean isStreamUrl(String text) {
         String value = text.toLowerCase(Locale.US);
         return value.startsWith("http://") || value.startsWith("https://")
@@ -1309,6 +1474,16 @@ final class PlaylistManager {
             candidate = base + "_" + suffix++;
         }
         return candidate;
+    }
+
+    private static String mobileCacheId(String location) {
+        try {
+            String digest = encodeHex(MessageDigest.getInstance("SHA-256").digest(
+                    location.getBytes("UTF-8")));
+            return "mobile_" + digest.substring(0, 20);
+        } catch (Exception impossible) {
+            return "mobile_" + Integer.toHexString(location.hashCode());
+        }
     }
 
     private static String emptyToDefault(String value, String fallback) {

@@ -3,43 +3,131 @@ package xiao.bu.tv;
 import android.annotation.SuppressLint;
 import android.annotation.TargetApi;
 import android.app.Activity;
-import android.content.ActivityNotFoundException;
 import android.content.ClipData;
+import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
 import android.graphics.Color;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.view.HapticFeedbackConstants;
 import android.view.View;
+import android.view.Gravity;
+import android.widget.FrameLayout;
+import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
-import android.webkit.WebBackForwardList;
 import android.webkit.WebViewClient;
 import android.webkit.WebChromeClient;
-import android.webkit.WebHistoryItem;
 import android.webkit.ValueCallback;
 import android.widget.Toast;
 
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
+import java.util.Locale;
+import java.util.WeakHashMap;
 
 public final class ManagementActivity extends Activity {
+    // Accessed only on the main thread. Closing a page must not end its cast session.
+    private static final WeakHashMap<ManagementActivity, Boolean> openPages =
+            new WeakHashMap<ManagementActivity, Boolean>();
+
+    static void closeAll() {
+        ManagementActivity[] pages = openPages.keySet().toArray(new ManagementActivity[0]);
+        openPages.clear();
+        for (ManagementActivity page : pages) {
+            page.setResult(RESULT_CANCELED);
+            page.finish();
+        }
+    }
+
     static final String EXTRA_URL = "management_url";
+
     private static final int FILE_CHOOSER_REQUEST = 4601;
+    private static final int SCREENSHOT_PERMISSION_REQUEST = 4602;
+    private boolean screenshotPermissionPending;
+    private boolean screenshotBusy;
     private WebView webView;
-    private boolean clearInitialHistory = true;
     private String managementUrl;
     private ValueCallback<Uri[]> filePathCallback;
     private ValueCallback<Uri> legacyFileCallback;
+    private NativeDeviceBridge nativeDeviceBridge;
+
+    private boolean clearHistoryAfterTakeover;
+    private volatile boolean localPointerPage;
+    private volatile boolean localPointerResumed;
+    private final android.os.Handler recoveryHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+    private String currentPageUrl;
+    private boolean pendingRendererRecovery;
+    private int rendererRetries;
+    private volatile boolean systemDark;
+    private boolean sidebarDevice;
 
     @SuppressLint("SetJavaScriptEnabled")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        sidebarDevice = usesSidebar(this);
+        setRequestedOrientation(sidebarDevice
+                ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                : ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+        openPages.put(this, Boolean.TRUE);
         applySystemUiVisibility();
+        managementUrl = getIntent().getStringExtra(EXTRA_URL);
+        if (managementUrl == null || managementUrl.length() == 0) {
+            finish();
+            return;
+        }
+        createManagementWebView(managementUrl);
+    }
+
+    public static boolean isTablet(Context context) {
+        Configuration config = context.getResources().getConfiguration();
+        return config.smallestScreenWidthDp >= 600;
+    }
+
+    static boolean usesSidebar(Context context) {
+        if (isTablet(context)) return true;
+        android.view.WindowManager manager = (android.view.WindowManager)
+                context.getSystemService(Context.WINDOW_SERVICE);
+        if (manager == null) return false;
+        android.view.Display display = manager.getDefaultDisplay();
+        android.util.DisplayMetrics metrics = new android.util.DisplayMetrics();
+        display.getMetrics(metrics);
+        return hasLandscapeNaturalOrientation(metrics.widthPixels, metrics.heightPixels,
+                display.getRotation());
+    }
+
+    static boolean hasLandscapeNaturalOrientation(int width, int height, int rotation) {
+        // Some landscape tablets/TVs report only 480 dp. Do not force these into
+        // the phone's portrait window. Undo rotation so a rotated phone stays a phone.
+        boolean quarterTurn = rotation == android.view.Surface.ROTATION_90
+                || rotation == android.view.Surface.ROTATION_270;
+        return quarterTurn ? height > width : width > height;
+    }
+
+    private static String flyMousePageUrl(String baseUrl) {
+        return Uri.parse(baseUrl).buildUpon()
+                .path("/pages/flymouse.html")
+                .clearQuery()
+                .fragment(null)
+                .build()
+                .toString();
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private void createManagementWebView(String urlToLoad) {
+        readSystemTheme();
         webView = new WebView(this);
-        webView.setBackgroundColor(Color.rgb(247, 247, 248));
+        webView.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        webView.setBackgroundColor(systemDark ? Color.rgb(17, 20, 25) : Color.rgb(247, 247, 248));
         // Several Android TV/tablet WebView implementations render a black frame when
         // a hardware-decoded Surface is paused underneath. The local control page is
         // lightweight, so software composition is more reliable here.
@@ -47,15 +135,39 @@ public final class ManagementActivity extends Activity {
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
+        settings.setAllowContentAccess(true);
         settings.setLoadWithOverviewMode(true);
         settings.setUseWideViewPort(true);
+        nativeDeviceBridge = new NativeDeviceBridge();
+        webView.addJavascriptInterface(nativeDeviceBridge, "NtvDevice");
         webView.setWebChromeClient(Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP
                 ? new ModernFileChooserClient() : new LegacyFileChooserClient());
-        webView.setWebViewClient(new WebViewClient() {
+        WebViewRecovery.attach(webView, new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                if (view == webView) refreshPageTheme();
+                if (view == webView && clearHistoryAfterTakeover
+                        && flyMousePageUrl(managementUrl).equals(url)) {
+                    clearHistoryAfterTakeover = false;
+                    view.clearHistory();
+                }
+            }
+
+            @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                if (view != webView) return;
+                if (!sidebarDevice) setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+                if (isLocalControlPage(url)) currentPageUrl = url;
+                cancelLocalPointer();
+                // This bridge is only for our bundled touchpad, never a media website.
+                localPointerPage = isLocalControlPage(url)
+                        && "/pages/flymouse.html".equals(Uri.parse(url).getPath());
+                updatePointerDrawing(LocalPlayerRegistry.localInputOwner());
+            }
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, String url) {
                 Uri uri = Uri.parse(url);
-                if ("127.0.0.1".equals(uri.getHost())) {
+                if (isLocalControlPage(url)) {
                     return false;
                 }
                 try {
@@ -67,28 +179,109 @@ public final class ManagementActivity extends Activity {
                 return true;
             }
 
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                if (clearInitialHistory && isWebPage(url)) {
-                    clearInitialHistory = false;
-                    view.clearHistory();
+        }, this::onRendererGone);
+        final View outside = new View(this);
+        outside.setContentDescription("关闭管理网页");
+        outside.setOnClickListener(view -> finish());
+        FrameLayout panel = new FrameLayout(this) {
+            private boolean sidebar;
+            private int paneLeft;
+
+            @Override protected void onMeasure(int widthSpec, int heightSpec) {
+                int width = View.MeasureSpec.getSize(widthSpec), height = View.MeasureSpec.getSize(heightSpec);
+                sidebar = sidebarDevice && width > height;
+                if (sidebar) {
+                    // Keep the 720:1280 portrait proportions, but rasterize text at
+                    // the final screen resolution. Scaling a software WebView layer
+                    // blurs glyphs, particularly when a 4K display enlarges that layer.
+                    int paneWidth = Math.round(height * 720f / 1280f);
+                    paneLeft = width - paneWidth;
+                    setMeasuredDimension(width, height);
+                    webView.measure(View.MeasureSpec.makeMeasureSpec(paneWidth, View.MeasureSpec.EXACTLY),
+                            View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY));
+                    outside.measure(View.MeasureSpec.makeMeasureSpec(paneLeft, View.MeasureSpec.EXACTLY), heightSpec);
+                } else {
+                    paneLeft = 0;
+                    super.onMeasure(widthSpec, heightSpec);
+                }
+                outside.setVisibility(sidebar ? View.VISIBLE : View.GONE);
+            }
+
+            @Override protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+                if (sidebar) {
+                    outside.layout(0, 0, paneLeft, bottom - top);
+                    webView.layout(paneLeft, 0, right - left, bottom - top);
+                } else {
+                    super.onLayout(changed, left, top, right, bottom);
+                }
+            }
+        };
+        panel.addView(outside, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        panel.addView(webView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.RIGHT));
+        setContentView(panel);
+        webView.loadUrl(urlToLoad);
+    }
+
+    private void updatePointerDrawing(MainActivity owner) {
+        // Local management uses software composition above the native decoder.
+    }
+
+    private void onRendererGone(WebView failed, boolean crashed) {
+        if (failed != webView) return;
+        final MainActivity pointerOwner = localPointerPage
+                ? LocalPlayerRegistry.localInputOwner() : null;
+        localPointerPage = false;
+        webView = null;
+        if (nativeDeviceBridge != null) nativeDeviceBridge.stopSensors();
+        nativeDeviceBridge = null;
+        // These callbacks belong to the dead renderer; never call back into it.
+        filePathCallback = null;
+        legacyFileCallback = null;
+        showRendererRecoveryPanel();
+        // Do not dispatch events into another WebView while Chromium is still
+        // notifying the views sharing this dead renderer.
+        if (pointerOwner != null) recoveryHandler.post(new Runnable() {
+            @Override public void run() {
+                if (pointerOwner.ownsLocalPointerPage(managementUrl)) {
+                    try { pointerOwner.handleLocalPointer(new org.json.JSONObject().put("action", "cancel")); }
+                    catch (Exception ignored) { }
                 }
             }
         });
-        setContentView(webView);
-        managementUrl = getIntent().getStringExtra(EXTRA_URL);
-        if (managementUrl == null || managementUrl.length() == 0) {
-            finish();
-            return;
+        pendingRendererRecovery = rendererRetries++ < 1;
+        if (pendingRendererRecovery) {
+            recoveryHandler.postDelayed(this::recoverManagementPage, 750L);
         }
-        try {
-            webView.loadDataWithBaseURL(managementUrl, readControlHtml(),
-                    "text/html", "UTF-8", managementUrl);
-        } catch (IOException error) {
-            // The loopback URL remains a safe fallback if the bundled resource cannot
-            // be read on an unusual vendor build.
-            webView.loadUrl(managementUrl);
-        }
+    }
+
+    private void showRendererRecoveryPanel() {
+        android.widget.LinearLayout panel = new android.widget.LinearLayout(this);
+        panel.setOrientation(android.widget.LinearLayout.VERTICAL);
+        panel.setGravity(android.view.Gravity.CENTER);
+        panel.setBackgroundColor(Color.rgb(247, 247, 248));
+        android.widget.TextView message = new android.widget.TextView(this);
+        message.setText("网页渲染进程已退出，应用仍在运行。\n可重新打开管理界面。");
+        message.setTextColor(Color.DKGRAY);
+        message.setTextSize(18);
+        message.setGravity(android.view.Gravity.CENTER);
+        panel.addView(message);
+        android.widget.Button retry = new android.widget.Button(this);
+        retry.setText("重新打开管理界面");
+        retry.setOnClickListener(view -> {
+            rendererRetries = 0;
+            pendingRendererRecovery = true;
+            recoverManagementPage();
+        });
+        panel.addView(retry);
+        setContentView(panel);
+    }
+
+    private void recoverManagementPage() {
+        if (!pendingRendererRecovery || !localPointerResumed || isFinishing() || webView != null) return;
+        pendingRendererRecovery = false;
+        createManagementWebView(isLocalControlPage(currentPageUrl) ? currentPageUrl : managementUrl);
     }
 
     @Override
@@ -107,33 +300,41 @@ public final class ManagementActivity extends Activity {
         getWindow().getDecorView().setSystemUiVisibility(flags);
     }
 
-    private Intent playlistFileIntent() {
-        Intent intent = new Intent(Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT
-                ? Intent.ACTION_OPEN_DOCUMENT : Intent.ACTION_GET_CONTENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("*/*");
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
-            intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
-                    "text/plain",
-                    "application/vnd.apple.mpegurl",
-                    "application/x-mpegurl",
-                    "audio/mpegurl",
-                    "audio/x-mpegurl",
-                    "application/octet-stream"
-            });
-        }
-        return intent;
-    }
-
-    private void launchFileChooser() {
+    private void launchFileChooser(String[] accepted) {
         try {
-            startActivityForResult(Intent.createChooser(
-                    playlistFileIntent(), "选择频道源文件"), FILE_CHOOSER_REQUEST);
-        } catch (ActivityNotFoundException error) {
+            Intent chooser = fileChooserIntent(accepted);
+            if (chooser.resolveActivity(getPackageManager()) == null)
+                chooser.setAction(Intent.ACTION_GET_CONTENT);
+            startActivityForResult(Intent.createChooser(chooser, "选择文件"), FILE_CHOOSER_REQUEST);
+        } catch (RuntimeException error) {
             cancelFileChooser();
+            notifyFileChooser("无法打开文件选择器，请检查系统文件管理器");
+            android.util.Log.w("ManagementActivity", "File chooser launch failed", error);
             Toast.makeText(this, "系统中没有可用的文件管理器",
                     Toast.LENGTH_LONG).show();
         }
+    }
+
+    static Intent fileChooserIntent(String[] accepted) {
+        java.util.LinkedHashSet<String> types = new java.util.LinkedHashSet<>();
+        if (accepted != null) for (String value : accepted) {
+            if (value == null) continue;
+            // Chromium may return one comma-separated entry, rather than one entry
+            // per MIME type. A comma is invalid in Intent.setType().
+            for (String part : value.split(",")) {
+                String mime = part.trim().toLowerCase(Locale.US);
+                if (mime.startsWith(".")) mime = android.webkit.MimeTypeMap.getSingleton()
+                        .getMimeTypeFromExtension(mime.substring(1));
+                if (mime != null && mime.matches("[a-z0-9!#$&^_.+*\\-]+/[a-z0-9!#$&^_.+*\\-]+")) types.add(mime);
+            }
+        }
+        Intent chooser = new Intent(Build.VERSION.SDK_INT >= 19 ? Intent.ACTION_OPEN_DOCUMENT : Intent.ACTION_GET_CONTENT);
+        chooser.addCategory(Intent.CATEGORY_OPENABLE);
+        chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        chooser.setType(types.size() == 1 ? types.iterator().next() : "*/*");
+        if (Build.VERSION.SDK_INT >= 19 && types.size() > 1)
+            chooser.putExtra(Intent.EXTRA_MIME_TYPES, types.toArray(new String[types.size()]));
+        return chooser;
     }
 
     private void cancelFileChooser() {
@@ -153,16 +354,36 @@ public final class ManagementActivity extends Activity {
             super.onActivityResult(requestCode, resultCode, data);
             return;
         }
-        if (filePathCallback != null) {
-            filePathCallback.onReceiveValue(resultCode == RESULT_OK
-                    ? ModernResultParser.resultUris(data) : null);
-            filePathCallback = null;
+        Uri[] values = null;
+        if (resultCode == RESULT_OK && data != null) {
+            values = Build.VERSION.SDK_INT >= 16 ? ModernResultParser.resultUris(data)
+                    : data.getData() == null ? null : new Uri[] { data.getData() };
         }
-        if (legacyFileCallback != null) {
-            legacyFileCallback.onReceiveValue(resultCode == RESULT_OK && data != null
-                    ? data.getData() : null);
-            legacyFileCallback = null;
+        boolean delivered = values != null && values.length > 0 && values[0] != null;
+        android.util.Log.i("ManagementActivity", "File chooser result=" + resultCode
+                + " hasFile=" + delivered + " callback="
+                + (filePathCallback != null || legacyFileCallback != null));
+        notifyFileChooser(delivered ? "" : resultCode == RESULT_OK
+                ? "选择器未返回可读取的文件，请换用系统文件管理器" : "已取消选择文件");
+        ValueCallback<Uri[]> modern = filePathCallback;
+        ValueCallback<Uri> legacy = legacyFileCallback;
+        filePathCallback = null;
+        legacyFileCallback = null;
+        try {
+            if (modern != null) modern.onReceiveValue(delivered ? values : null);
+            if (legacy != null) legacy.onReceiveValue(delivered ? values[0] : null);
+        } catch (RuntimeException error) {
+            android.util.Log.w("ManagementActivity", "File chooser callback failed", error);
+            notifyFileChooser("文件回传失败，请重新打开管理页面后重试");
         }
+    }
+
+    private void notifyFileChooser(String message) {
+        if (webView == null) return;
+        String script = "window.multimediaChooserResult&&window.multimediaChooserResult("
+                + org.json.JSONObject.quote(message) + ")";
+        if (Build.VERSION.SDK_INT >= 19) webView.evaluateJavascript(script, null);
+        else webView.loadUrl("javascript:" + script);
     }
 
     @TargetApi(Build.VERSION_CODES.LOLLIPOP)
@@ -172,7 +393,7 @@ public final class ManagementActivity extends Activity {
                 FileChooserParams params) {
             cancelFileChooser();
             filePathCallback = callback;
-            launchFileChooser();
+            launchFileChooser(params == null ? null : params.getAcceptTypes());
             return true;
         }
 
@@ -211,77 +432,295 @@ public final class ManagementActivity extends Activity {
                 String capture) {
             cancelFileChooser();
             legacyFileCallback = callback;
-            launchFileChooser();
-        }
-    }
-
-    private String readControlHtml() throws IOException {
-        InputStream input = getResources().openRawResource(R.raw.control);
-        try {
-            ByteArrayOutputStream output = new ByteArrayOutputStream();
-            byte[] buffer = new byte[8192];
-            int count;
-            while ((count = input.read(buffer)) >= 0) {
-                output.write(buffer, 0, count);
-            }
-            return output.toString("UTF-8");
-        } finally {
-            input.close();
+            launchFileChooser(acceptType == null ? null : acceptType.split(","));
         }
     }
 
     @Override
     public void onBackPressed() {
-        if (webView == null) {
-            super.onBackPressed();
+        if (webView != null && Build.VERSION.SDK_INT >= 19) {
+            webView.evaluateJavascript("(function(){return typeof window.mediaDismissSheet==='function' && window.mediaDismissSheet();})()",
+                    new ValueCallback<String>() {
+                        @Override public void onReceiveValue(String value) {
+                            if (!"true".equals(value)) navigateBack();
+                        }
+                    });
             return;
         }
-        String currentUrl = webView.getUrl();
-        // The management home is the terminal page. Never reopen a secondary menu
-        // from its forward/back list after the user has already returned home.
-        if (isManagementHome(currentUrl)) {
+        if (webView != null) {
+            webView.loadUrl("javascript:(function(){if(!(typeof window.mediaDismissSheet==='function' && window.mediaDismissSheet()))NtvDevice.navigateBackAfterSheet();})()");
+            return;
+        }
+        navigateBack();
+    }
+
+    private void navigateBack() {
+        MainActivity owner=LocalPlayerRegistry.localInputOwner();
+        if(owner!=null && owner.backFromMultimedia())return;
+        if(owner!=null && owner.returnToRetainedWebPage()) {
             finish();
             return;
         }
-        if (goBackToPreviousLocalPage()) {
-            return;
-        }
-        // A directly opened #section has no previous item. Collapse it to the home
-        // document in-place so pressing Back does not reload or briefly show white.
-        if (hasFragment(currentUrl)) {
-            webView.loadUrl("javascript:window.handleManagementBack"
-                    + "&&window.handleManagementBack()");
+        if (webView != null && webView.canGoBack()) {
+            webView.goBack();
             return;
         }
         finish();
     }
 
-    private boolean goBackToPreviousLocalPage() {
-        WebBackForwardList history = webView.copyBackForwardList();
-        if (history == null || history.getCurrentIndex() <= 0) {
-            return false;
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode != SCREENSHOT_PERMISSION_REQUEST) return;
+        screenshotPermissionPending = false;
+        if (results.length > 0 && results[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            nativeDeviceBridge.saveVideoScreenshot();
+        } else {
+            Toast.makeText(this, "未允许存储权限，无法保存截图到相册", Toast.LENGTH_LONG).show();
         }
-        WebHistoryItem current = history.getItemAtIndex(history.getCurrentIndex());
-        String currentUrl = current == null ? null : current.getUrl();
-        for (int index = history.getCurrentIndex() - 1; index >= 0; index--) {
-            WebHistoryItem item = history.getItemAtIndex(index);
-            String candidate = item == null ? null : item.getUrl();
-            if (!isLocalControlPage(candidate) || sameUrl(candidate, currentUrl)) {
-                continue;
-            }
-            webView.goBackOrForward(index - history.getCurrentIndex());
-            return true;
-        }
-        return false;
     }
 
-    private boolean isManagementHome(String url) {
-        if (!isLocalControlPage(url) || hasFragment(url)) {
-            return false;
+    private final class NativeDeviceBridge implements SensorEventListener {
+        @JavascriptInterface
+        public boolean returnFromSniffedResource() {
+            MainActivity owner = LocalPlayerRegistry.localInputOwner();
+            if (owner == null || !owner.hasRetainedWebPlayback() || !isLocalControlPage(currentPageUrl)) return false;
+            runOnUiThread(() -> {
+                if (owner.returnToRetainedWebPage() && true) finish();
+            });
+            return true;
         }
-        Uri base = Uri.parse(managementUrl);
-        Uri current = Uri.parse(url);
-        return safePath(base).equals(safePath(current));
+
+        @JavascriptInterface
+        public boolean returnFromMultimedia() {
+            MainActivity owner=LocalPlayerRegistry.localInputOwner();
+            if(owner==null || !owner.hasActiveMultimedia() || !isLocalControlPage(currentPageUrl))return false;
+            runOnUiThread(() -> owner.backFromMultimedia());return true;
+        }
+
+        @JavascriptInterface
+        public void setKeyboardLandscape(final boolean landscape) {
+            runOnUiThread(new Runnable() {
+                @Override public void run() {
+                    if (webView == null || isFinishing() || sidebarDevice
+                            || !isLocalControlPage(webView.getUrl())
+                            || !"/pages/flymouse.html".equals(Uri.parse(webView.getUrl()).getPath())) return;
+                    setRequestedOrientation(landscape
+                            ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                            : ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+                }
+            });
+        }
+        @JavascriptInterface
+        public void navigateBackAfterSheet() {
+            runOnUiThread(new Runnable() {
+                @Override public void run() {
+                    if (webView != null && !isFinishing() && isLocalControlPage(webView.getUrl())) ManagementActivity.this.navigateBack();
+                }
+            });
+        }
+        @JavascriptInterface
+        public boolean isSystemDark() {
+            return systemDark;
+        }
+        private final SensorManager sensorManager = (SensorManager)
+                getSystemService(SENSOR_SERVICE);
+        private final Sensor gyroscope = sensorManager == null ? null
+                : sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
+        private boolean listening;
+        private long lastHapticTickAt;
+
+        @JavascriptInterface
+        public String sendPointer(String body) {
+            final MainActivity target = LocalPlayerRegistry.localInputOwner();
+            if (!localPointerPage || !localPointerResumed || target == null
+                    || !target.ownsLocalPointerPage(managementUrl)) return "";
+            if (body == null || body.length() > 4096) {
+                return "{\"ok\":false,\"message\":\"飞鼠指令过长\"}";
+            }
+            final org.json.JSONObject request;
+            try { request = new org.json.JSONObject(body); }
+            catch (org.json.JSONException error) {
+                return "{\"ok\":false,\"message\":\"飞鼠指令无效\"}";
+            }
+            // The JavaScript bridge already runs away from the UI thread. Motion
+            // is coalesced there by MainActivity and only one VSYNC task reaches
+            // the main looper; button boundaries still flush motion in order.
+            try {
+                org.json.JSONObject response = new org.json.JSONObject(
+                        target.handleLocalPointer(request));
+                response.put("transport", "local");
+                return response.toString();
+            } catch (final Exception error) {
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        if (!isFinishing()) Toast.makeText(ManagementActivity.this,
+                                error.getMessage(), Toast.LENGTH_SHORT).show();
+                    }
+                });
+            }
+            return "{\"ok\":false,\"transport\":\"local\",\"message\":\"飞鼠操作失败\"}";
+        }
+
+        @JavascriptInterface
+        public void navigateBack() {
+            runOnUiThread(new Runnable() {
+                @Override public void run() {
+                    if (webView != null && !isFinishing() && isLocalControlPage(webView.getUrl())) {
+                        onBackPressed();
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void saveVideoScreenshot() {
+            runOnUiThread(new Runnable() {
+                @Override public void run() {
+                    if (webView == null || isFinishing() || screenshotBusy
+                            || !isLocalControlPage(webView.getUrl())
+                            || !("/video-recorder.html".equals(Uri.parse(webView.getUrl()).getPath())
+                                || "/pages/media.html".equals(Uri.parse(webView.getUrl()).getPath()))) {
+                        return;
+                    }
+                    if (Build.VERSION.SDK_INT >= 23 && Build.VERSION.SDK_INT <= 28
+                            && checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                        if (!screenshotPermissionPending) {
+                            screenshotPermissionPending = true;
+                            requestPermissions(new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                                    SCREENSHOT_PERMISSION_REQUEST);
+                        }
+                        return;
+                    }
+                    screenshotBusy = true;
+                    final String url = Uri.parse(managementUrl).buildUpon()
+                            .path(VideoScreenshot.PATH).clearQuery().fragment(null).build().toString();
+                    Toast.makeText(ManagementActivity.this, "正在截取视频画面…", Toast.LENGTH_SHORT).show();
+                    new Thread(new Runnable() {
+                        @Override public void run() {
+                            try {
+                                final byte[] image = VideoScreenshot.download(url);
+                                ScreenshotGallery.save(getApplicationContext(), image);
+                                runOnUiThread(new Runnable() {
+                                    @Override public void run() {
+                                        screenshotBusy = false;
+                                        Toast.makeText(ManagementActivity.this, "截图已保存到相册 Pictures/nTv",
+                                                Toast.LENGTH_LONG).show();
+                                    }
+                                });
+                            } catch (final Exception error) {
+                                runOnUiThread(new Runnable() {
+                                    @Override public void run() {
+                                        screenshotBusy = false;
+                                        Toast.makeText(ManagementActivity.this,
+                                                error.getMessage(), Toast.LENGTH_LONG).show();
+                                    }
+                                });
+                            }
+                        }
+                    }, "capture-video-screenshot").start();
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public boolean hasGyroscope() {
+            return gyroscope != null;
+        }
+
+        @JavascriptInterface
+        public void startGyroscope() {
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    if (!listening && sensorManager != null && gyroscope != null) {
+                        listening = sensorManager.registerListener(NativeDeviceBridge.this,
+                                gyroscope, SensorManager.SENSOR_DELAY_GAME);
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void stopGyroscope() {
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    stopSensors();
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void vibrate(int durationMillis) {
+            final int safeDuration = Math.max(1, Math.min(100, durationMillis));
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    Vibrator vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
+                    if (vibrator == null || !vibrator.hasVibrator()) {
+                        return;
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        vibrator.vibrate(VibrationEffect.createOneShot(safeDuration,
+                                VibrationEffect.DEFAULT_AMPLITUDE));
+                    } else {
+                        vibrator.vibrate(safeDuration);
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void hapticTick() {
+            runOnUiThread(new Runnable() {
+                @Override public void run() {
+                    long now = android.os.SystemClock.elapsedRealtime();
+                    if (now - lastHapticTickAt < 18L) return;
+                    lastHapticTickAt = now;
+                    Vibrator vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
+                    if (vibrator == null || !vibrator.hasVibrator()) return;
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            // Let the device map a short detent to its linear motor.
+                            vibrator.vibrate(VibrationEffect.createPredefined(
+                                    VibrationEffect.EFFECT_TICK));
+                        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            vibrator.vibrate(VibrationEffect.createOneShot(7L, 72));
+                        } else if (!webView.performHapticFeedback(
+                                HapticFeedbackConstants.CLOCK_TICK)) {
+                            vibrator.vibrate(7L);
+                        }
+                    } catch (RuntimeException error) {
+                        webView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
+                    }
+                }
+            });
+        }
+
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            if (!listening || event == null || event.values.length < 3
+                    || webView == null) {
+                return;
+            }
+            final String script = String.format(Locale.US,
+                    "window.__ntvNativeGyroscope&&window.__ntvNativeGyroscope(%.7f,%.7f,%.7f)",
+                    event.values[0], event.values[1], event.values[2]);
+            webView.evaluateJavascript(script, null);
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+        }
+
+        void stopSensors() {
+            if (sensorManager != null && listening) {
+                sensorManager.unregisterListener(this);
+            }
+            listening = false;
+        }
     }
 
     private boolean isLocalControlPage(String url) {
@@ -293,16 +732,6 @@ public final class ManagementActivity extends Activity {
         return equalsIgnoreCase(base.getScheme(), current.getScheme())
                 && equalsIgnoreCase(base.getHost(), current.getHost())
                 && effectivePort(base) == effectivePort(current);
-    }
-
-    private static boolean hasFragment(String url) {
-        return url != null && Uri.parse(url).getFragment() != null
-                && Uri.parse(url).getFragment().length() > 0;
-    }
-
-    private static String safePath(Uri uri) {
-        String path = uri == null ? null : uri.getPath();
-        return path == null || path.length() == 0 ? "/" : path;
     }
 
     private static int effectivePort(Uri uri) {
@@ -321,10 +750,6 @@ public final class ManagementActivity extends Activity {
                 && first.equalsIgnoreCase(second);
     }
 
-    private static boolean sameUrl(String first, String second) {
-        return first == null ? second == null : first.equals(second);
-    }
-
     private static boolean isWebPage(String url) {
         if (url == null) {
             return false;
@@ -334,10 +759,81 @@ public final class ManagementActivity extends Activity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        readSystemTheme();
+        refreshPageTheme();
+        localPointerResumed = true;
+        recoverManagementPage();
+        applySystemUiVisibility();
+        if (webView != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            webView.evaluateJavascript(
+                    "window.resumeRemoteControl&&window.resumeRemoteControl()", null);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        localPointerResumed = false;
+        cancelLocalPointer();
+        if (webView != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            webView.evaluateJavascript(
+                    "window.suspendRemoteControl&&window.suspendRemoteControl()", null);
+        }
+        if (nativeDeviceBridge != null) {
+            nativeDeviceBridge.stopSensors();
+        }
+        super.onPause();
+    }
+
+    private void readSystemTheme() {
+        systemDark = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
+                == Configuration.UI_MODE_NIGHT_YES;
+    }
+
+    private void refreshPageTheme() {
+        if (webView == null || !isLocalControlPage(webView.getUrl())) return;
+        String script = "window.refreshSystemTheme&&window.refreshSystemTheme()";
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) webView.evaluateJavascript(script, null);
+        else webView.loadUrl("javascript:" + script);
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration configuration) {
+        super.onConfigurationChanged(configuration);
+        readSystemTheme();
+        refreshPageTheme();
+    }
+
+    private void cancelLocalPointer() {
+        MainActivity target = LocalPlayerRegistry.localInputOwner();
+        if (!localPointerPage || target == null || !target.ownsLocalPointerPage(managementUrl)) return;
+        try { target.handleLocalPointer(new org.json.JSONObject().put("action", "cancel")); }
+        catch (Exception ignored) { }
+    }
+
+    @Override
     protected void onDestroy() {
+        openPages.remove(this);
+        recoveryHandler.removeCallbacksAndMessages(null);
+        pendingRendererRecovery = false;
+        cancelLocalPointer();
+        localPointerPage = false;
         cancelFileChooser();
+        if (nativeDeviceBridge != null) {
+            nativeDeviceBridge.stopSensors();
+            nativeDeviceBridge = null;
+        }
         if (webView != null) {
             webView.stopLoading();
+            webView.onPause();
+            // Detach the window before freeing Chromium's drawing resources.
+            // Older GPU drivers cannot safely keep drawing a destroyed WebView.
+            android.view.ViewParent parent = webView.getParent();
+            if (parent instanceof android.view.ViewGroup) {
+                ((android.view.ViewGroup) parent).removeView(webView);
+            }
+            webView.setWebChromeClient(null);
             webView.destroy();
             webView = null;
         }
